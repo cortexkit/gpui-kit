@@ -371,3 +371,85 @@ fn textarea_body_click_focuses_editor_and_supports_editing(cx: &mut TestAppConte
 fn editor_body_click_focuses_editor_and_supports_editing(cx: &mut TestAppContext) {
     exercise_multiline_body_focus(cx, true);
 }
+
+/// A field inside a dialog. The dialog's Enter is `Confirm` in the `Dialog`
+/// key context, and this view counts how often it arrives, beside how often
+/// the field sends `PressEnter`.
+struct InDialog {
+    field: Entity<InputState>,
+    confirms: usize,
+    enters: usize,
+    _subscription: gpui_kit::Subscription,
+}
+
+impl Render for InDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("Dialog")
+            .on_action(
+                cx.listener(|this, _: &gpui_kit::component::dialog::Confirm, _, cx| {
+                    this.confirms += 1;
+                    cx.notify();
+                }),
+            )
+            .size_full()
+            .p_4()
+            .child(Input::new(&self.field).id("field").w_96())
+    }
+}
+
+fn field_in_dialog(
+    reaches: bool,
+    cx: &mut TestAppContext,
+) -> (WindowHandle<Root>, Entity<InDialog>) {
+    cx.update(gpui_kit::init);
+    common::open_window(cx, Some(size(px(640.), px(480.))), |window, cx| {
+        cx.new(|cx| {
+            let field =
+                cx.new(|cx| InputState::new(window, cx).enter_reaches_enclosing(reaches));
+            let subscription = cx.subscribe(
+                &field,
+                |this: &mut InDialog, _, event: &gpui_kit::component::input::InputEvent, _| {
+                    if let gpui_kit::component::input::InputEvent::PressEnter { .. } = event {
+                        this.enters += 1;
+                    }
+                },
+            );
+            InDialog {
+                field,
+                confirms: 0,
+                enters: 0,
+                _subscription: subscription,
+            }
+        })
+    })
+}
+
+fn press_enter_in_field(handle: WindowHandle<Root>, cx: &mut TestAppContext) {
+    cx.update_window(handle.into(), |_, window, cx| window.click("field", cx))
+        .unwrap();
+    cx.run_until_parked();
+    press(handle, "enter", cx);
+}
+
+#[gpui_kit::test]
+fn enter_in_a_field_goes_on_to_the_dialog_by_default(cx: &mut TestAppContext) {
+    let (handle, view) = field_in_dialog(true, cx);
+    press_enter_in_field(handle, cx);
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.enters, 1, "the field sent PressEnter");
+        assert_eq!(view.confirms, 1, "the dialog's Confirm ran");
+    });
+}
+
+#[gpui_kit::test]
+fn a_field_that_keeps_enter_leaves_the_dialog_open(cx: &mut TestAppContext) {
+    let (handle, view) = field_in_dialog(false, cx);
+    press_enter_in_field(handle, cx);
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.enters, 1, "the field sent PressEnter");
+        assert_eq!(view.confirms, 0, "Enter went on to the dialog");
+    });
+}

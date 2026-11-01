@@ -487,6 +487,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
+    /// See [`Self::enter_reaches_enclosing`].
+    pub(super) enter_reaches_enclosing: bool,
     /// Overrides for [`Self::text_input_configuration`].
     pub(super) input_action: Option<TextInputAction>,
     pub(super) autocorrect: Option<bool>,
@@ -980,6 +982,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             masked: false,
             clean_on_escape: false,
             submit_on_enter: false,
+            enter_reaches_enclosing: true,
             input_action: None,
             autocorrect: None,
             autocapitalize: None,
@@ -1448,6 +1451,20 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_submit_on_enter(&mut self, submit: bool, cx: &mut Context<Self>) {
         self.submit_on_enter = submit;
         cx.notify();
+    }
+
+    /// Whether an `Enter` that submits (in a single-line input, or a
+    /// multi-line one that submits on enter) goes on, after
+    /// [`InputEvent::PressEnter`], to what encloses the input, such as a
+    /// dialog's `Confirm`, which closes it.
+    ///
+    /// Default is `true`: a one-line field in a dialog confirms the dialog.
+    /// Set `false` when the owner's handling of `PressEnter` is the whole
+    /// answer, for example a reply sent from a dialog that stays open until
+    /// the reply has landed, or a field that only moves focus on.
+    pub fn enter_reaches_enclosing(mut self, reaches: bool) -> Self {
+        self.enter_reaches_enclosing = reaches;
+        self
     }
 
     /// Set the action a software keyboard shows on its enter key, like Search
@@ -2398,9 +2415,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         } else {
             // Single line input or submit-on-enter: just emit the event
-            // (e.g.: in a dialog to confirm, or a chat textarea to send).
+            // (e.g.: in a dialog to confirm, or a chat textarea to send), and
+            // let the action go on to what encloses the input unless the
+            // owner keeps it ([`Self::enter_reaches_enclosing`]).
             self.undo_manager.break_transaction_coalescing();
-            cx.propagate();
+            if self.enter_reaches_enclosing {
+                cx.propagate();
+            }
         }
 
         cx.emit(InputEvent::PressEnter {
