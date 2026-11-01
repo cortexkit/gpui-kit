@@ -586,6 +586,29 @@ fn a_drag_stays_in_the_region_it_started_in(cx: &mut TestAppContext) {
     // one holds the selection.
     let free = at(right, 5.);
     assert!(cx.update(|window, cx| TextSelection::is_selectable_at(free, window, cx)));
+    // A double click there selects its word, though the last selection was
+    // in the left region.
+    for event in [true, false] {
+        let (position, modifiers) = (at(right, 5.), Modifiers::default());
+        if event {
+            cx.simulate_event(gpui_kit::MouseDownEvent {
+                position,
+                modifiers,
+                button: MouseButton::Left,
+                click_count: 2,
+                first_mouse: false,
+            });
+        } else {
+            cx.simulate_event(gpui_kit::MouseUpEvent {
+                position,
+                modifiers,
+                button: MouseButton::Left,
+                click_count: 2,
+            });
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    assert_eq!(window_selected_text(&mut cx).trim(), "right");
 }
 
 fn window_selected_text(cx: &mut VisualTestContext) -> String {

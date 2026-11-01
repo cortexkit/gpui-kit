@@ -1390,10 +1390,6 @@ struct WindowSelectionState {
     /// [`WindowSelectionState::register_quietly`].
     participants: RefCell<HashMap<EntityId, ParticipantRegistration>>,
     active_scope: TextSelectionScopeId,
-    /// The region the selection started in, once a gesture has started: its
-    /// cursor is found, and its text taken, only among participants of that
-    /// region. `Some(None)` is the text outside every region.
-    gesture_region: Option<Option<TextSelectionRegionId>>,
     /// A prepaint projection owned by this window and reset with its selection.
     table_cell_anchor: Cell<Option<(TextSelectionEndpoint, Bounds<Pixels>)>>,
     touch_select_all: bool,
@@ -1806,7 +1802,6 @@ impl WindowSelectionState {
         self.stop_anchor_auto_scroll(cx);
         self.anchor = None;
         self.cursor = None;
-        self.gesture_region = None;
         self.pending_extension_anchor = None;
         self.unit = None;
         self.is_selecting = false;
@@ -2456,17 +2451,19 @@ impl WindowSelectionState {
             self.clear(cx);
         }
         // A shift-click extends within the region its anchor is in; a fresh
-        // press may land anywhere, and its region is taken from where it lands.
-        self.gesture_region = previous_anchor
-            .as_ref()
-            .map(|anchor| self.region_of(anchor));
-        let endpoint = self.endpoint(position, window.as_deref(), cx);
+        // press may land on text in any region.
+        let endpoint = match &previous_anchor {
+            Some(anchor) => {
+                let region = Some(self.region_of(anchor));
+                self.endpoint_among(position, window.as_deref(), region, cx)
+            }
+            None => self.hit(position, window.as_deref(), cx),
+        };
         let focus_participant = endpoint
             .inside
             .then(|| endpoint.participant.clone())
             .flatten();
         let anchor = previous_anchor.unwrap_or_else(|| endpoint.clone());
-        self.gesture_region = Some(self.region_of(&anchor));
         self.anchor = Some(anchor.clone());
         self.cursor = Some(endpoint.clone());
         self.did_hit_text = anchor.inside_text || endpoint.inside_text;
@@ -2501,16 +2498,25 @@ impl WindowSelectionState {
         self.publish_snapshots(cx);
     }
 
-    /// Where `position` falls for the gesture under way: only text in the
-    /// region the gesture started in counts.
+    /// Where `position` falls for the selection under way: only text in the
+    /// region its anchor is in counts.
     fn endpoint(
         &mut self,
         position: Point<Pixels>,
         window: Option<&Window>,
         cx: &App,
     ) -> SelectionEndpoint {
-        let region = self.gesture_region;
+        let region = self.gesture_region();
         self.endpoint_among(position, window, region, cx)
+    }
+
+    /// The region the selection's anchor is in, which holds the whole
+    /// selection: `None` with no selection, and `Some(None)` for an anchor on
+    /// text outside every region. It is read from the anchor, never kept
+    /// apart, so every way of starting a selection (a press, a double or
+    /// triple click, select-all) sets it.
+    fn gesture_region(&self) -> Option<Option<TextSelectionRegionId>> {
+        self.anchor.as_ref().map(|anchor| self.region_of(anchor))
     }
 
     /// Where `position` falls for a press that may start a new gesture: text
@@ -2719,10 +2725,10 @@ impl WindowSelectionState {
             .and_then(|registration| registration.registration.region)
     }
 
-    /// Whether `registration` may take part in the current gesture: always,
-    /// before a gesture has started; otherwise only in the region it started in.
+    /// Whether `registration` may take part in the selection: always, with no
+    /// selection; otherwise only in the region its anchor is in.
     fn in_gesture_region(&self, registration: &ParticipantRegistration) -> bool {
-        self.gesture_region
+        self.gesture_region()
             .is_none_or(|region| registration.registration.region == region)
     }
 
