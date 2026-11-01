@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+      # CortexKit's copy: its changes live on `cortexkit`, rebased onto
+      # upstream's main, so each push there runs the full suite too.
+      - cortexkit
     tags:
       - "*"
       # `shell-<tag>` only records which commit a release's gpui-shell
