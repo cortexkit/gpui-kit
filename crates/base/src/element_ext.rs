@@ -1,6 +1,6 @@
 use gpui::{App, Bounds, IntoElement, ParentElement, Pixels, Styled as _, Window, canvas};
 
-use crate::TextSelectionScopeId;
+use crate::{TextSelectionRegionId, TextSelectionScopeId};
 
 /// Extends a GPUI parent element with post-layout prepaint observation.
 pub trait ElementExt: ParentElement + Sized {
@@ -10,6 +10,15 @@ pub trait ElementExt: ParentElement + Sized {
         Self: IntoElement,
     {
         crate::text_selection::text_selection_scope(scope, self)
+    }
+
+    /// Marks this element subtree as a text-selection region: a drag that
+    /// starts on text inside extends only over text inside.
+    fn text_selection_region(self, region: TextSelectionRegionId) -> impl IntoElement
+    where
+        Self: IntoElement,
+    {
+        crate::text_selection::text_selection_region(region, self)
     }
 
     /// Invokes `callback` during prepaint with this element's resolved bounds.

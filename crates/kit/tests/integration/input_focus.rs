@@ -405,8 +405,7 @@ fn field_in_dialog(
     cx.update(gpui_kit::init);
     common::open_window(cx, Some(size(px(640.), px(480.))), |window, cx| {
         cx.new(|cx| {
-            let field =
-                cx.new(|cx| InputState::new(window, cx).enter_reaches_enclosing(reaches));
+            let field = cx.new(|cx| InputState::new(window, cx).enter_reaches_enclosing(reaches));
             let subscription = cx.subscribe(
                 &field,
                 |this: &mut InDialog, _, event: &gpui_kit::component::input::InputEvent, _| {

@@ -535,6 +535,59 @@ fn highlighter_change_preserves_selection_but_parser_change_clears_it(cx: &mut T
     );
 }
 
+/// Two side-by-side regions, each holding one line of selectable text.
+struct TwoRegions {
+    regions: [gpui_kit::base::TextSelectionRegionId; 2],
+}
+
+impl Render for TwoRegions {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::base::ElementExt as _;
+        let side = |id: &'static str, text: &'static str, region| {
+            div()
+                .w(px(240.))
+                .h(px(80.))
+                .child(
+                    div()
+                        .debug_selector(move || id.to_string())
+                        .child(SelectableText::new(id, text)),
+                )
+                .text_selection_region(region)
+        };
+        div()
+            .flex()
+            .child(side("left", "left region text", self.regions[0]))
+            .child(side("right", "right region text", self.regions[1]))
+    }
+}
+
+#[gpui_kit::test]
+fn a_drag_stays_in_the_region_it_started_in(cx: &mut TestAppContext) {
+    use gpui_kit::base::TextSelectionRegionId;
+    cx.update(gpui_kit::init);
+    let (window, _) = common::open_window(cx, None, |_, cx| {
+        cx.new(|_| TwoRegions {
+            regions: [TextSelectionRegionId::new(), TextSelectionRegionId::new()],
+        })
+    });
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let left = cx.debug_bounds("left").expect("the left text is drawn");
+    let right = cx.debug_bounds("right").expect("the right text is drawn");
+    let at = |bounds: Bounds<Pixels>, x: f32| point(bounds.left() + px(x), bounds.center().y);
+    // Each region's text is selectable on its own.
+    drag(&mut cx, at(right, 1.), at(right, 200.));
+    assert_eq!(window_selected_text(&mut cx), "right region text");
+    // From the left region into the right one, only the left's text.
+    drag(&mut cx, at(left, 1.), at(right, 200.));
+    assert_eq!(window_selected_text(&mut cx), "left region text");
+    // The right region's text stays free for the next press while the left
+    // one holds the selection.
+    let free = at(right, 5.);
+    assert!(cx.update(|window, cx| TextSelection::is_selectable_at(free, window, cx)));
+}
+
 fn window_selected_text(cx: &mut VisualTestContext) -> String {
     cx.update(|window, cx| TextSelection::selected_text(window, cx))
 }

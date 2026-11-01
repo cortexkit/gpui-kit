@@ -45,6 +45,32 @@ impl TextSelectionScopeId {
     }
 }
 
+/// An opaque selection region identifier.
+///
+/// A region keeps a selection inside it, without hiding the text outside it.
+/// A drag that starts on text in a region extends only over text in that
+/// region; text outside every region is a region of its own. Text in every
+/// region stays selectable, unlike text outside the active
+/// [`TextSelectionScopeId`], so side-by-side panes can each be a region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextSelectionRegionId(u64);
+
+impl TextSelectionRegionId {
+    /// Allocates a process-unique region identifier.
+    ///
+    /// Keep the returned identifier for the lifetime of the region; do not
+    /// allocate a new identifier on every frame.
+    pub fn new() -> Self {
+        static NEXT_REGION_ID: AtomicU64 = AtomicU64::new(1);
+        let value = NEXT_REGION_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .expect("text selection region identifiers exhausted");
+        Self(value)
+    }
+}
+
 /// Stable participant-defined identity for virtualized participant content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextSelectionContentKey(u64);
@@ -219,6 +245,8 @@ pub struct TextSelectionRegistration {
     bounds: Bounds<Pixels>,
     scroll_offset: Point<Pixels>,
     scope: TextSelectionScopeId,
+    /// The innermost [`TextSelectionRegionId`] the text was drawn in, if any.
+    region: Option<TextSelectionRegionId>,
     document_order: u64,
     paint_order: bool,
     text_bounds: Vec<Bounds<Pixels>>,
@@ -235,6 +263,7 @@ impl TextSelectionRegistration {
             bounds,
             scroll_offset: Point::default(),
             scope: TextSelectionScopeId::default(),
+            region: None,
             document_order: 0,
             paint_order: false,
             text_bounds: Vec::new(),
@@ -295,6 +324,13 @@ impl TextSelectionRegistration {
     }
 
     /// Sets the opaque selection scope.
+    /// Sets the region the text belongs to. [`TextSelectionHandle::register`]
+    /// sets it from the innermost region the text is drawn in.
+    pub fn with_region(mut self, region: Option<TextSelectionRegionId>) -> Self {
+        self.region = region;
+        self
+    }
+
     pub fn with_scope(mut self, scope: TextSelectionScopeId) -> Self {
         self.scope = scope;
         self
@@ -971,8 +1007,12 @@ impl TextSelectionHandle {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(scope) = current_text_selection_scope(window.window_handle().window_id(), cx) {
+        let window_id = window.window_handle().window_id();
+        if let Some(scope) = current_text_selection_scope(window_id, cx) {
             registration.scope = scope;
+        }
+        if let Some(region) = current_marker::<TextSelectionRegionId>(window_id, cx) {
+            registration.region = Some(region);
         }
         let Some(state) = WindowSelectionState::existing(window, cx) else {
             return;
@@ -1350,6 +1390,10 @@ struct WindowSelectionState {
     /// [`WindowSelectionState::register_quietly`].
     participants: RefCell<HashMap<EntityId, ParticipantRegistration>>,
     active_scope: TextSelectionScopeId,
+    /// The region the selection started in, once a gesture has started: its
+    /// cursor is found, and its text taken, only among participants of that
+    /// region. `Some(None)` is the text outside every region.
+    gesture_region: Option<Option<TextSelectionRegionId>>,
     /// A prepaint projection owned by this window and reset with its selection.
     table_cell_anchor: Cell<Option<(TextSelectionEndpoint, Bounds<Pixels>)>>,
     touch_select_all: bool,
@@ -1762,6 +1806,7 @@ impl WindowSelectionState {
         self.stop_anchor_auto_scroll(cx);
         self.anchor = None;
         self.cursor = None;
+        self.gesture_region = None;
         self.pending_extension_anchor = None;
         self.unit = None;
         self.is_selecting = false;
@@ -2231,7 +2276,7 @@ impl WindowSelectionState {
         if GlobalState::is_text_selection_suppressed(cx) {
             return None;
         }
-        let hit = self.endpoint(position, Some(window), cx);
+        let hit = self.hit(position, Some(window), cx);
         if !hit.inside_text {
             return None;
         }
@@ -2410,12 +2455,18 @@ impl WindowSelectionState {
         if !extend && !already_prepared {
             self.clear(cx);
         }
+        // A shift-click extends within the region its anchor is in; a fresh
+        // press may land anywhere, and its region is taken from where it lands.
+        self.gesture_region = previous_anchor
+            .as_ref()
+            .map(|anchor| self.region_of(anchor));
         let endpoint = self.endpoint(position, window.as_deref(), cx);
         let focus_participant = endpoint
             .inside
             .then(|| endpoint.participant.clone())
             .flatten();
         let anchor = previous_anchor.unwrap_or_else(|| endpoint.clone());
+        self.gesture_region = Some(self.region_of(&anchor));
         self.anchor = Some(anchor.clone());
         self.cursor = Some(endpoint.clone());
         self.did_hit_text = anchor.inside_text || endpoint.inside_text;
@@ -2450,10 +2501,36 @@ impl WindowSelectionState {
         self.publish_snapshots(cx);
     }
 
+    /// Where `position` falls for the gesture under way: only text in the
+    /// region the gesture started in counts.
     fn endpoint(
         &mut self,
         position: Point<Pixels>,
         window: Option<&Window>,
+        cx: &App,
+    ) -> SelectionEndpoint {
+        let region = self.gesture_region;
+        self.endpoint_among(position, window, region, cx)
+    }
+
+    /// Where `position` falls for a press that may start a new gesture: text
+    /// in any region counts, whatever region the last selection was in.
+    fn hit(
+        &mut self,
+        position: Point<Pixels>,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> SelectionEndpoint {
+        self.endpoint_among(position, window, None, cx)
+    }
+
+    /// Where `position` falls among the participants in `region`, or among
+    /// all of them when `region` is `None`.
+    fn endpoint_among(
+        &mut self,
+        position: Point<Pixels>,
+        window: Option<&Window>,
+        region: Option<Option<TextSelectionRegionId>>,
         cx: &App,
     ) -> SelectionEndpoint {
         self.prune_dead_participants();
@@ -2464,6 +2541,7 @@ impl WindowSelectionState {
         for registration in self.participants.borrow().values() {
             if registration.registration.scope != self.active_scope
                 || registration.participant.upgrade().is_none()
+                || region.is_some_and(|region| registration.registration.region != region)
             {
                 continue;
             }
@@ -2627,7 +2705,25 @@ impl WindowSelectionState {
         let end = anchor_registration
             .document_order
             .max(cursor_registration.document_order);
-        (start..=end).contains(&registration.document_order) || id == anchor || id == cursor
+        ((start..=end).contains(&registration.document_order) || id == anchor || id == cursor)
+            && self.in_gesture_region(registration)
+    }
+
+    /// The region of the participant `endpoint` is on; `None` for text
+    /// outside every region, or an endpoint on no participant.
+    fn region_of(&self, endpoint: &SelectionEndpoint) -> Option<TextSelectionRegionId> {
+        let id = endpoint.entity_id()?;
+        self.participants
+            .borrow()
+            .get(&id)
+            .and_then(|registration| registration.registration.region)
+    }
+
+    /// Whether `registration` may take part in the current gesture: always,
+    /// before a gesture has started; otherwise only in the region it started in.
+    fn in_gesture_region(&self, registration: &ParticipantRegistration) -> bool {
+        self.gesture_region
+            .is_none_or(|region| registration.registration.region == region)
     }
 
     fn update_auto_scroll(
@@ -2784,24 +2880,29 @@ struct PendingTextSelectionScopes(HashMap<gpui::WindowId, TextSelectionScopeId>)
 
 impl Global for PendingTextSelectionScopes {}
 
-#[derive(Default)]
-struct TextSelectionScopeStacks(HashMap<gpui::WindowId, Vec<TextSelectionScopeId>>);
+/// Per window, the markers of one kind (a [`TextSelectionScopeId`] or a
+/// [`TextSelectionRegionId`]) that the element being drawn is inside,
+/// innermost last.
+struct MarkerStacks<T>(HashMap<gpui::WindowId, Vec<T>>);
 
-impl Global for TextSelectionScopeStacks {}
-
-fn push_text_selection_scope(window_id: gpui::WindowId, scope: TextSelectionScopeId, cx: &mut App) {
-    if !cx.has_global::<TextSelectionScopeStacks>() {
-        cx.set_global(TextSelectionScopeStacks::default());
+impl<T> Default for MarkerStacks<T> {
+    fn default() -> Self {
+        Self(HashMap::default())
     }
-    cx.global_mut::<TextSelectionScopeStacks>()
+}
+
+impl<T: 'static> Global for MarkerStacks<T> {}
+
+fn push_marker<T: Copy + 'static>(window_id: gpui::WindowId, marker: T, cx: &mut App) {
+    cx.default_global::<MarkerStacks<T>>()
         .0
         .entry(window_id)
         .or_default()
-        .push(scope);
+        .push(marker);
 }
 
-fn pop_text_selection_scope(window_id: gpui::WindowId, cx: &mut App) {
-    let stacks = &mut cx.global_mut::<TextSelectionScopeStacks>().0;
+fn pop_marker<T: 'static>(window_id: gpui::WindowId, cx: &mut App) {
+    let stacks = &mut cx.global_mut::<MarkerStacks<T>>().0;
     let remove_stack = stacks.get_mut(&window_id).is_some_and(|stack| {
         stack.pop();
         stack.is_empty()
@@ -2811,33 +2912,34 @@ fn pop_text_selection_scope(window_id: gpui::WindowId, cx: &mut App) {
     }
 }
 
-fn current_text_selection_scope(
-    window_id: gpui::WindowId,
-    cx: &App,
-) -> Option<TextSelectionScopeId> {
-    cx.has_global::<TextSelectionScopeStacks>()
-        .then(|| {
-            cx.global::<TextSelectionScopeStacks>()
-                .0
-                .get(&window_id)
-                .and_then(|stack| stack.last().copied())
-        })
-        .flatten()
+fn current_marker<T: Copy + 'static>(window_id: gpui::WindowId, cx: &App) -> Option<T> {
+    cx.try_global::<MarkerStacks<T>>()
+        .and_then(|stacks| stacks.0.get(&window_id))
+        .and_then(|stack| stack.last().copied())
 }
 
-fn with_text_selection_scope<T>(
+/// Runs `callback` with `marker` as the innermost marker of its kind for
+/// `window_id`, and takes it off again even if `callback` panics.
+fn with_marker<T: Copy + 'static, R>(
     window_id: gpui::WindowId,
-    scope: TextSelectionScopeId,
+    marker: T,
     cx: &mut App,
-    callback: impl FnOnce(&mut App) -> T,
-) -> T {
-    push_text_selection_scope(window_id, scope, cx);
+    callback: impl FnOnce(&mut App) -> R,
+) -> R {
+    push_marker(window_id, marker, cx);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(cx)));
-    pop_text_selection_scope(window_id, cx);
+    pop_marker::<T>(window_id, cx);
     match result {
         Ok(result) => result,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+fn current_text_selection_scope(
+    window_id: gpui::WindowId,
+    cx: &App,
+) -> Option<TextSelectionScopeId> {
+    current_marker(window_id, cx)
 }
 
 /// Window-level operations for text selection.
@@ -2855,8 +2957,7 @@ impl TextSelection {
     pub fn is_selectable_at(position: Point<Pixels>, window: &Window, cx: &mut App) -> bool {
         live_text_selection_state(window, cx).is_some_and(|state| {
             state.update(cx, |state, cx| {
-                !state.touch.covers(position)
-                    && state.endpoint(position, Some(window), cx).inside_text
+                !state.touch.covers(position) && state.hit(position, Some(window), cx).inside_text
             })
         })
     }
@@ -3003,18 +3104,30 @@ pub(crate) fn text_selection_scope(
     scope: TextSelectionScopeId,
     element: impl IntoElement,
 ) -> impl IntoElement {
-    TextSelectionScopeMarker {
-        scope,
+    SelectionMarker {
+        marker: scope,
         element: element.into_element(),
     }
 }
 
-struct TextSelectionScopeMarker<E> {
-    scope: TextSelectionScopeId,
+pub(crate) fn text_selection_region(
+    region: TextSelectionRegionId,
+    element: impl IntoElement,
+) -> impl IntoElement {
+    SelectionMarker {
+        marker: region,
+        element: element.into_element(),
+    }
+}
+
+/// Draws `element` with `marker` as the innermost marker of its kind, so the
+/// text inside registers with it.
+struct SelectionMarker<E, T> {
+    marker: T,
     element: E,
 }
 
-impl<E: Element> IntoElement for TextSelectionScopeMarker<E> {
+impl<E: Element, T: Copy + 'static> IntoElement for SelectionMarker<E, T> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -3022,7 +3135,7 @@ impl<E: Element> IntoElement for TextSelectionScopeMarker<E> {
     }
 }
 
-impl<E: Element> Element for TextSelectionScopeMarker<E> {
+impl<E: Element, T: Copy + 'static> Element for SelectionMarker<E, T> {
     type RequestLayoutState = E::RequestLayoutState;
     type PrepaintState = E::PrepaintState;
 
@@ -3042,7 +3155,7 @@ impl<E: Element> Element for TextSelectionScopeMarker<E> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let window_id = window.window_handle().window_id();
-        with_text_selection_scope(window_id, self.scope, cx, |cx| {
+        with_marker(window_id, self.marker, cx, |cx| {
             self.element.request_layout(id, inspector_id, window, cx)
         })
     }
@@ -3057,7 +3170,7 @@ impl<E: Element> Element for TextSelectionScopeMarker<E> {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let window_id = window.window_handle().window_id();
-        with_text_selection_scope(window_id, self.scope, cx, |cx| {
+        with_marker(window_id, self.marker, cx, |cx| {
             self.element
                 .prepaint(id, inspector_id, bounds, request_layout, window, cx)
         })
@@ -3074,7 +3187,7 @@ impl<E: Element> Element for TextSelectionScopeMarker<E> {
         cx: &mut App,
     ) {
         let window_id = window.window_handle().window_id();
-        with_text_selection_scope(window_id, self.scope, cx, |cx| {
+        with_marker(window_id, self.marker, cx, |cx| {
             self.element.paint(
                 id,
                 inspector_id,
@@ -3340,7 +3453,7 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
                 || state.read(cx).touch.covers(event.start_position)
                 || !state.update(cx, |state, cx| {
                     state
-                        .endpoint(event.start_position, Some(window), cx)
+                        .hit(event.start_position, Some(window), cx)
                         .inside_text
                 })
             {
@@ -3686,6 +3799,18 @@ mod tests {
             document_order: u64,
             cx: &mut gpui::App,
         ) {
+            self.register_in(selection_state, y, scope, None, document_order, cx);
+        }
+
+        fn register_in(
+            &self,
+            selection_state: &mut WindowSelectionState,
+            y: f32,
+            scope: TextSelectionScopeId,
+            region: Option<TextSelectionRegionId>,
+            document_order: u64,
+            cx: &mut gpui::App,
+        ) {
             let bounds = Bounds::new(point(px(0.), px(y)), size(px(100.), px(10.)));
             selection_state.register_participant(
                 self.selection.clone(),
@@ -3699,6 +3824,7 @@ mod tests {
                     bounds,
                 )
                 .with_scope(scope)
+                .with_region(region)
                 .with_document_order(document_order)
                 .with_text_bounds(vec![bounds]),
                 cx,
@@ -3744,7 +3870,7 @@ mod tests {
 
         cx.update(|cx| {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_text_selection_scope(window_id, scope, cx, |_| panic!("subtree failed"));
+                with_marker(window_id, scope, cx, |_| panic!("subtree failed"));
             }));
 
             assert!(result.is_err());
@@ -3765,7 +3891,7 @@ mod tests {
         let scope = TextSelectionScopeId::from_raw(42);
 
         cx.update(|cx| {
-            with_text_selection_scope(first_window_id, scope, cx, |cx| {
+            with_marker(first_window_id, scope, cx, |cx| {
                 assert_eq!(current_text_selection_scope(second_window_id, cx), None);
                 assert_eq!(
                     current_text_selection_scope(first_window_id, cx),
@@ -4343,6 +4469,50 @@ mod tests {
             selection_state.begin(point(px(1.), px(21.)), false, cx);
             selection_state.update(point(px(8.), px(21.)), cx);
             assert!(!selection_state.has_selection(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn a_selection_stays_in_the_region_it_started_in(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut selection_state = WindowSelectionState::default();
+            let scope = TextSelectionScopeId::default();
+            let (left, right) = (TextSelectionRegionId::new(), TextSelectionRegionId::new());
+            let first = FakeParticipant::new("first", cx);
+            let second = FakeParticipant::new("second", cx);
+            let third = FakeParticipant::new("third", cx);
+            first.register_in(&mut selection_state, 0., scope, Some(left), 0, cx);
+            second.register_in(&mut selection_state, 20., scope, Some(left), 1, cx);
+            third.register_in(&mut selection_state, 40., scope, Some(right), 2, cx);
+
+            // Text in both regions stays selectable on its own.
+            selection_state.begin(point(px(1.), px(41.)), false, cx);
+            selection_state.update(point(px(8.), px(41.)), cx);
+            selection_state.end(cx);
+            assert_eq!(selection_state.selected_text(cx), "third");
+
+            // A drag from the first region down into the second takes the
+            // first region's text and stops at its end.
+            selection_state.clear(cx);
+            selection_state.begin(point(px(1.), px(1.)), false, cx);
+            selection_state.update(point(px(1.), px(45.)), cx);
+            selection_state.end(cx);
+            assert_eq!(selection_state.selected_text(cx), "first\nsecond");
+
+            // A selection kept in the first region leaves the second's text
+            // free for the next press.
+            assert!(
+                selection_state
+                    .hit(point(px(5.), px(45.)), None, cx)
+                    .inside_text
+            );
+
+            // Back up from the second region, only its own text.
+            selection_state.clear(cx);
+            selection_state.begin(point(px(99.), px(49.)), false, cx);
+            selection_state.update(point(px(1.), px(1.)), cx);
+            selection_state.end(cx);
+            assert_eq!(selection_state.selected_text(cx), "third");
         });
     }
 
