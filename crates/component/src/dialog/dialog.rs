@@ -1223,6 +1223,25 @@ pub(crate) mod tests {
     /// Opening a new dialog while the previous one is leaving keeps both
     /// mounted for the exit: the new dialog owns focus and survives it.
     #[gpui::test]
+    fn the_dialog_count_leaves_out_a_dialog_on_its_way_out(cx: &mut TestAppContext) {
+        let cx = window(cx, size(px(1000.), px(800.)));
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        assert_eq!(cx.update(|window, cx| window.active_dialog_count(cx)), 0);
+        open(cx, |dialog, _, _| dialog.title("First").child("body"));
+        open(cx, |dialog, _, _| dialog.title("Second").child("body"));
+        // Both finish entering, so closing the top one plays its exit.
+        cx.background_executor.advance_clock(*ANIMATION_DURATION);
+        frame(cx);
+        assert_eq!(cx.update(|window, cx| window.active_dialog_count(cx)), 2);
+        cx.update(|window, cx| window.close_dialog(cx));
+        frame(cx);
+        cx.update(|window, cx| {
+            assert_eq!(WindowState::read(window, cx).active_dialogs.len(), 2);
+            assert_eq!(window.active_dialog_count(cx), 1);
+        });
+    }
+
+    #[gpui::test]
     fn reopening_during_the_exit_keeps_the_new_dialog(cx: &mut TestAppContext) {
         let cx = window(cx, size(px(1000.), px(800.)));
         cx.update(|_, cx| cx.set_reduce_motion(false));
