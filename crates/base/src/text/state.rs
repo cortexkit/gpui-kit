@@ -44,6 +44,13 @@ const MAX_COALESCED_UPDATES_PER_PARSE: usize = 64;
 // Preserve exact first-layout height for small documents while bounding the
 // amount of source parsed synchronously on the UI thread.
 const MAX_SYNC_FULL_REPLACE_BYTES: usize = 4 * 1024;
+// A view with no document yet lays out as empty until its first parse lands.
+// A list that remembers each row's height, as GPUI's `list` does for rows
+// above the visible ones, then keeps that empty height, and scrolling onto
+// the row jumps by its real height. So a first parse runs on the UI thread
+// for much larger documents; a replacement keeps the old document on screen
+// while it parses, so it keeps the smaller bound above.
+const MAX_SYNC_FIRST_PARSE_BYTES: usize = 256 * 1024;
 // Repaint a streamed fade at about 30 fps, not at the display refresh rate.
 const STREAM_FADE_TICK: Duration = Duration::from_millis(33);
 
@@ -523,6 +530,8 @@ impl TextViewState {
     }
 
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
+        // Nothing parsed has been committed yet, so the view shows nothing.
+        let first = self.committed_revision == 0;
         self.revision += 1;
         if !append {
             self.full_update_revision = self.revision;
@@ -532,7 +541,12 @@ impl TextViewState {
             self.selection_adapter.clear_copy_projections(cx);
             self.parsed_content.document.clear_selection();
         }
-        let parse_synchronously = !append && text.len() <= MAX_SYNC_FULL_REPLACE_BYTES;
+        let bound = if first {
+            MAX_SYNC_FIRST_PARSE_BYTES
+        } else {
+            MAX_SYNC_FULL_REPLACE_BYTES
+        };
+        let parse_synchronously = !append && text.len() <= bound;
         let update_options = UpdateOptions {
             revision: self.revision,
             append,
@@ -1758,7 +1772,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn large_markdown_and_html_full_replacements_wait_for_background_executor(
+    fn a_large_first_parse_is_immediate_and_a_large_replacement_waits_for_background_executor(
         cx: &mut TestAppContext,
     ) {
         cx.update(crate::init);
@@ -1774,19 +1788,8 @@ mod tests {
             )
         });
 
-        markdown_state.read_with(cx, |state, _| {
-            assert_eq!(state.text.as_str(), markdown.as_str());
-            assert!(state.source().as_str().is_empty());
-            assert!(state.parsed_content.document.blocks.is_empty());
-        });
-        html_state.read_with(cx, |state, _| {
-            assert_eq!(state.text.as_str(), html.as_str());
-            assert!(state.source().as_str().is_empty());
-            assert!(state.parsed_content.document.blocks.is_empty());
-        });
-
-        cx.run_until_parked();
-
+        // A view's first document is parsed at once, so its first layout has
+        // its real height.
         markdown_state.read_with(cx, |state, _| {
             assert_eq!(state.source().as_str(), markdown.as_str());
             assert!(!state.parsed_content.document.blocks.is_empty());
@@ -1794,6 +1797,35 @@ mod tests {
         html_state.read_with(cx, |state, _| {
             assert_eq!(state.source().as_str(), html.as_str());
             assert!(!state.parsed_content.document.blocks.is_empty());
+        });
+
+        // A large replacement keeps the old document until the background
+        // parse lands.
+        let replaced = "# y\n\n".repeat(MAX_SYNC_FULL_REPLACE_BYTES / 5 + 1);
+        markdown_state.update(cx, |state, cx| state.set_text(&replaced, cx));
+        markdown_state.read_with(cx, |state, _| {
+            assert_eq!(state.text.as_str(), replaced.as_str());
+            assert_eq!(state.source().as_str(), markdown.as_str());
+        });
+        cx.run_until_parked();
+        markdown_state.read_with(cx, |state, _| {
+            assert_eq!(state.source().as_str(), replaced.as_str());
+        });
+    }
+
+    #[gpui::test]
+    fn a_first_parse_beyond_its_bound_waits_for_background_executor(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let markdown = "# x\n\n".repeat(MAX_SYNC_FIRST_PARSE_BYTES / 5 + 1);
+        assert!(markdown.len() > MAX_SYNC_FIRST_PARSE_BYTES);
+        let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(&markdown, cx)));
+        state.read_with(cx, |state, _| {
+            assert!(state.source().as_str().is_empty());
+            assert!(state.parsed_content.document.blocks.is_empty());
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.source().as_str(), markdown.as_str());
         });
     }
 
@@ -3046,12 +3078,14 @@ mod tests {
                 "{}\n\n**tail**",
                 "word ".repeat(MAX_SYNC_FULL_REPLACE_BYTES / 4)
             );
-            let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown(&markdown, cx)));
+            // A first document is parsed at once; replacing it with a large
+            // one parses in the background, keeping the first meanwhile.
+            let state = cx.update(|cx| cx.new(|cx| TextViewState::markdown("first", cx)));
+            state.update(cx, |state, cx| state.set_text(&markdown, cx));
             let tail = find(&markdown, "**tail**");
             state.read_with(cx, |state, _| {
                 let text = state.rendered_text();
-                assert!(text.source().is_empty());
-                assert!(text.is_empty());
+                assert_eq!(text.source(), "first");
                 assert_eq!(text.range_for_source(tail.clone()), None);
             });
             cx.run_until_parked();
