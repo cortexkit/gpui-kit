@@ -326,6 +326,9 @@ pub(super) struct Inline {
     /// The start of a pending reveal, when it is in this text.
     reveal: Option<RevealAt>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    /// The accessibility nodes this frame gave the links, with each link's
+    /// address, for paint to register a screen reader's press on each.
+    a11y_links: Vec<(gpui::accesskit::NodeId, SharedString)>,
     /// What this frame's layout was shaped with, to hand the shaped text to
     /// the next frame (see [`RetainedLayout`]).
     retained_key: Option<(Vec<TextRun>, TextStyle)>,
@@ -712,6 +715,7 @@ impl Inline {
             range_backgrounds: Vec::new(),
             reveal: None,
             link_click_handler,
+            a11y_links: Vec::new(),
             retained_key: None,
             handed_over: false,
             editor_piece: None,
@@ -1117,12 +1121,109 @@ impl IntoElement for Inline {
     }
 }
 
+/// The pieces of `text` a screen reader reads in order: plain text between
+/// links, and each link with its index in `links`. A link whose range isn't
+/// in `text`, as in a fragment of a wrapped line, reads as text.
+fn a11y_pieces<'a>(
+    text: &'a str,
+    links: &[(Range<usize>, LinkMark)],
+) -> Vec<(&'a str, Option<usize>)> {
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    let mut ordered: Vec<(usize, &Range<usize>)> = links
+        .iter()
+        .enumerate()
+        .map(|(ix, (range, _))| (ix, range))
+        .filter(|(_, range)| range.start < range.end && text.get(range.start..range.end).is_some())
+        .collect();
+    ordered.sort_by_key(|(_, range)| range.start);
+    for (ix, range) in ordered {
+        if range.start < at {
+            continue;
+        }
+        if at < range.start {
+            pieces.push((&text[at..range.start], None));
+        }
+        pieces.push((&text[range.clone()], Some(ix)));
+        at = range.end;
+    }
+    if at < text.len() {
+        pieces.push((&text[at..], None));
+    }
+    pieces.retain(|(piece, link)| link.is_some() || !piece.trim().is_empty());
+    pieces
+}
+
 impl Element for Inline {
     type RequestLayoutState = ();
     type PrepaintState = Hitbox;
 
+    /// Text has an id so screen readers can be given it (see
+    /// [`Self::a11y_role`]). Its state is shared by the text across frames,
+    /// so the id stays the same for as long as the text is shown; the
+    /// fragment's start tells apart pieces of one wrapped line.
     fn id(&self) -> Option<ElementId> {
-        None
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::default();
+        (Arc::as_ptr(&self.state) as usize).hash(&mut hasher);
+        self.selection_source
+            .as_ref()
+            .map(|(_, range)| range.start)
+            .hash(&mut hasher);
+        self.editor_piece.hash(&mut hasher);
+        Some(ElementId::NamedInteger("text".into(), hasher.finish()))
+    }
+
+    /// Plain text is one piece of static text. Text with links is a group of
+    /// its pieces (see [`Self::a11y_synthetic_children`]), so a screen reader
+    /// reaches each link and can press it.
+    fn a11y_role(&self) -> Option<gpui::Role> {
+        if a11y_pieces(&self.text, &self.links)
+            .iter()
+            .any(|(_, link)| link.is_some())
+        {
+            Some(gpui::Role::Paragraph)
+        } else {
+            Some(gpui::Role::Label)
+        }
+    }
+
+    fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
+        if node.role() == gpui::Role::Label {
+            node.set_value(self.text.to_string());
+        }
+    }
+
+    fn a11y_synthetic_children(
+        &mut self,
+        _: &mut Self::PrepaintState,
+        builder: &mut gpui::A11ySubtreeBuilder,
+    ) {
+        let pieces = a11y_pieces(&self.text, &self.links);
+        if !pieces.iter().any(|(_, link)| link.is_some()) {
+            return;
+        }
+        for (key, (piece, link)) in pieces.into_iter().enumerate() {
+            let id = builder.synthetic_node_id(key);
+            let node = match link {
+                Some(ix) => {
+                    let url = self.links[ix].1.url.clone();
+                    let mut node = gpui::accesskit::Node::new(gpui::Role::Link);
+                    node.set_label(piece.trim().to_string());
+                    node.set_url(url.to_string());
+                    node.add_action(gpui::accesskit::Action::Click);
+                    // Paint registers the press for this node.
+                    self.a11y_links.push((id, url));
+                    node
+                }
+                None => {
+                    let mut node = gpui::accesskit::Node::new(gpui::Role::Label);
+                    node.set_value(piece.to_string());
+                    node
+                }
+            };
+            builder.push_child(id, node);
+        }
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -1213,6 +1314,23 @@ impl Element for Inline {
         crate::test_support::record_text(self.text.clone(), false, bounds, window);
         let current_view = window.current_view();
         let hitbox = prepaint;
+        // A screen reader's press on a link opens it as Enter on a focused
+        // link would.
+        for (node, url) in mem::take(&mut self.a11y_links) {
+            let handler = self.link_click_handler.clone();
+            let bounds = hitbox.bounds;
+            window.on_a11y_action(
+                node,
+                gpui::accesskit::Action::Click,
+                move |_, window, cx| {
+                    let click = ClickEvent::Keyboard(gpui::KeyboardClickEvent {
+                        button: gpui::KeyboardButton::Enter,
+                        bounds,
+                    });
+                    handle_link_click(&handler, url.clone(), click, window, cx);
+                },
+            );
+        }
         if !self.reclaim_styled_text() {
             // Cannot happen (only this element takes what it handed over,
             // and a live state is never swept); skip the frame rather than
@@ -2420,11 +2538,45 @@ pub(super) mod test_fonts {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlyphBox, InlineHighlight, aligned_row_left, combine_highlights, point_in_text_selection,
-        range_boxes, text_runs,
+        GlyphBox, InlineHighlight, a11y_pieces, aligned_row_left, combine_highlights,
+        point_in_text_selection, range_boxes, text_runs,
     };
+    use crate::text::node::LinkMark;
     use gpui::{FontWeight, HighlightStyle, SharedString, TextAlign, TextStyle, point, px};
     use std::ops::Range;
+
+    #[test]
+    fn a_screen_reader_reads_text_and_links_in_order() {
+        let link = |range: Range<usize>, url: &str| {
+            (
+                range,
+                LinkMark {
+                    url: url.to_string().into(),
+                    ..LinkMark::default()
+                },
+            )
+        };
+        let text = "See the mock and the notes.";
+        // Listed out of order, as a link found later can come first.
+        let links = vec![link(21..26, "notes.md"), link(8..12, "mock.html")];
+        assert_eq!(
+            a11y_pieces(text, &links),
+            vec![
+                ("See the ", None),
+                ("mock", Some(1)),
+                (" and the ", None),
+                ("notes", Some(0)),
+                (".", None),
+            ]
+        );
+        // Text without links is one piece, and a link outside the text, as
+        // in a fragment of a wrapped line, reads as text.
+        assert_eq!(a11y_pieces("Plain", &[]), vec![("Plain", None)]);
+        assert_eq!(
+            a11y_pieces("Short", &[link(3..40, "x")]),
+            vec![("Short", None)]
+        );
+    }
 
     fn mono(style: HighlightStyle) -> InlineHighlight {
         InlineHighlight {
