@@ -1,3 +1,7 @@
+use std::time::Duration;
+
+use web_time::Instant;
+
 use super::auto_close::AutoClosedPairs;
 use crate::input::change::Change;
 
@@ -5,6 +9,13 @@ use super::cursor::CursorSelection;
 
 const MAX_UNDO_TRANSACTIONS: usize = 1000;
 const MAX_CHANGES_PER_TRANSACTION: usize = 1000;
+
+/// How long a run of typing or deleting keeps merging into one undo step. A
+/// pause longer than this starts a new step, so undo takes back the bursts
+/// the user actually typed, not a whole paragraph at once. The rule, with
+/// whitespace starting a new step ([`starts_a_word`]), follows Zeron's
+/// composer (github.com/zeronsh/zeron, MIT).
+const COALESCE_WINDOW: Duration = Duration::from_millis(700);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditIntent {
@@ -32,6 +43,9 @@ struct UndoTransaction {
     selections_after: Option<Vec<CursorSelection>>,
     auto_closed_pairs_before: Option<AutoClosedPairs>,
     auto_closed_pairs_after: Option<AutoClosedPairs>,
+    /// When the latest batch landed, against which [`COALESCE_WINDOW`] is
+    /// measured.
+    last_batch_at: Instant,
 }
 
 /// A batch of changes being collected between `begin_transaction` and the
@@ -186,10 +200,13 @@ impl UndoManager {
         }
 
         self.redo_transactions.clear();
+        let now = Instant::now();
         let can_coalesce = !self.coalescing_boundary
             && intent != EditIntent::Atomic
+            && !(intent == EditIntent::Typing && changes.iter().any(starts_a_word))
             && self.undo_transactions.last().is_some_and(|previous| {
                 previous.intent == intent
+                    && now.saturating_duration_since(previous.last_batch_at) < COALESCE_WINDOW
                     && previous.last_batch_len == changes.len()
                     && previous.recorded_changes + changes.len() <= MAX_CHANGES_PER_TRANSACTION
                     && is_adjacent_batch(intent, previous.trailing_batch(), &changes)
@@ -202,6 +219,7 @@ impl UndoManager {
                 .expect("coalescing requires a previous transaction");
             previous.last_batch_len = changes.len();
             previous.recorded_changes += changes.len();
+            previous.last_batch_at = now;
             // Adjacent single-cursor keystrokes form one contiguous insertion.
             // Keep it as one change so undo and redo replay it as a single
             // edit rather than once per keystroke.
@@ -231,8 +249,21 @@ impl UndoManager {
             selections_after: None,
             auto_closed_pairs_before: None,
             auto_closed_pairs_after: None,
+            last_batch_at: now,
         });
         self.coalescing_boundary = intent == EditIntent::Atomic;
+    }
+
+    /// Moves the latest step's last edit back by `by`, as if the user had
+    /// paused that long since.
+    #[cfg(test)]
+    fn pause(&mut self, by: Duration) {
+        if let Some(transaction) = self.undo_transactions.last_mut() {
+            transaction.last_batch_at = transaction
+                .last_batch_at
+                .checked_sub(by)
+                .expect("a pause within the clock's range");
+        }
     }
 
     /// Record the cursors around the transaction being built, or around the
@@ -436,6 +467,12 @@ fn is_adjacent_batch(intent: EditIntent, previous: &[Change], current: &[Change]
         .all(|((previous, current), shift)| is_adjacent(intent, &previous.shifted(shift), current))
 }
 
+/// Whether typing `change` starts a new word, which starts a new undo step:
+/// "hello world" undoes as " world", then "hello".
+fn starts_a_word(change: &Change) -> bool {
+    change.new_text.starts_with(char::is_whitespace)
+}
+
 fn is_adjacent(intent: EditIntent, previous: &Change, current: &Change) -> bool {
     if previous.token_delta.is_some() || current.token_delta.is_some() {
         return false;
@@ -479,6 +516,46 @@ mod tests {
 
         // The run is kept as one insertion, so undo replays a single change.
         assert_eq!(manager.undo().unwrap().changes, [typing_change(0, "ab")]);
+        assert!(manager.undo().is_none());
+    }
+
+    #[test]
+    fn typing_after_a_pause_starts_a_new_step() {
+        let mut manager = UndoManager::new();
+        manager.record_transaction(typing_change(0, "a"), EditIntent::Typing);
+        manager.pause(COALESCE_WINDOW);
+        manager.record_transaction(typing_change(1, "b"), EditIntent::Typing);
+
+        assert_eq!(manager.undo().unwrap().changes, [typing_change(1, "b")]);
+        assert_eq!(manager.undo().unwrap().changes, [typing_change(0, "a")]);
+        assert!(manager.undo().is_none());
+    }
+
+    #[test]
+    fn a_space_starts_a_new_step_with_the_word_after_it() {
+        let mut manager = UndoManager::new();
+        for (offset, text) in [(0, "h"), (1, "i"), (2, " "), (3, "y"), (4, "o")] {
+            manager.record_transaction(typing_change(offset, text), EditIntent::Typing);
+        }
+
+        assert_eq!(manager.undo().unwrap().changes, [typing_change(2, " yo")]);
+        assert_eq!(manager.undo().unwrap().changes, [typing_change(0, "hi")]);
+        assert!(manager.undo().is_none());
+    }
+
+    #[test]
+    fn deleting_after_a_pause_starts_a_new_step() {
+        // Backspace twice over "ab": first "b" at 1, then "a" at 0.
+        let delete = |offset: usize, text: &str| {
+            Change::new(offset..offset + text.len(), text, offset..offset, "")
+        };
+        let mut manager = UndoManager::new();
+        manager.record_transaction(delete(1, "b"), EditIntent::Backspace);
+        manager.pause(COALESCE_WINDOW);
+        manager.record_transaction(delete(0, "a"), EditIntent::Backspace);
+
+        assert_eq!(manager.undo().unwrap().changes, [delete(0, "a")]);
+        assert_eq!(manager.undo().unwrap().changes, [delete(1, "b")]);
         assert!(manager.undo().is_none());
     }
 

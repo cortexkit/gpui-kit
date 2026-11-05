@@ -302,6 +302,11 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
+        // Redo also takes Ctrl+Shift+Z, the Ctrl form of the macOS key.
+        // Binding it here also keeps an app's own Ctrl+Shift+Z from reaching
+        // past a text field that has focus.
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-.", ToggleCodeActions, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
