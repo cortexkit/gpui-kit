@@ -2327,8 +2327,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // In multi-line mode with `submit_on_enter` enabled, a plain `Enter`
         // (without Shift) is treated as submit: propagate the action and emit
         // PressEnter without inserting a newline. `Shift+Enter` still inserts
-        // a newline.
-        let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
+        // a newline. The secondary Enter (Cmd+Enter on macOS, Ctrl+Enter
+        // elsewhere) is an application's submit in every mode, so it never
+        // inserts one.
+        let insert_newline =
+            self.is_multi_line() && !action.secondary && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
             if !self.selections.is_single() {
@@ -7961,6 +7964,51 @@ mod tests {
                 assert_eq!(state.value(), "");
             });
         });
+    }
+
+    /// Cmd+Enter (Ctrl+Enter elsewhere) submits from a multi-line field
+    /// without adding a line, while a plain Enter there still adds one.
+    #[gpui::test]
+    fn the_secondary_enter_submits_a_textarea_without_a_newline(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let pressed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let pressed = pressed.clone();
+            window
+                .subscribe(&input, cx, move |_, event: &InputEvent, _, _| {
+                    if let InputEvent::PressEnter { secondary, .. } = event {
+                        pressed.borrow_mut().push(*secondary);
+                    }
+                })
+                .detach();
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "line", window, cx);
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line", "Cmd+Enter added a line");
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "line\n", "a plain Enter added no line");
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(*pressed.borrow(), [true, false]);
     }
 
     #[gpui::test]
