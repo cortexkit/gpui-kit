@@ -952,6 +952,7 @@ impl Element for TextView {
         if self.selectable {
             state.read(cx).selection_adapter.begin_frame();
         }
+        state.read(cx).begin_range_places();
 
         GlobalState::global(cx).push_text_view_state(state.clone());
         if let Some(clip_bottom) = prepaint.clip_bottom {

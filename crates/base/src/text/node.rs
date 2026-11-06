@@ -27,7 +27,7 @@ use crate::{
             point_in_text_selection, text_runs, text_size_ranges,
         },
         inline_flow::{InlineFlow, InlineFlowItem, slice_ranges},
-        range_highlight::{RangeHighlightFrame, RevealAt, RevealRequest},
+        range_highlight::{RangeHighlightFrame, RangePaint, RevealAt, RevealRequest},
         stream_fade::{StreamFadeFrame, TextLeafKey},
         text_view::handle_link_click,
     },
@@ -2747,7 +2747,7 @@ impl NodeContext {
 
     /// The range highlight backgrounds of the text leaf `key`, in its
     /// rendered byte space.
-    fn range_backgrounds(&self, key: Option<TextLeafKey>) -> &[(Range<usize>, Hsla)] {
+    fn range_backgrounds(&self, key: Option<TextLeafKey>) -> &[(Range<usize>, RangePaint)] {
         match (&self.range_highlights, key) {
             (Some(frame), Some(key)) => frame.backgrounds(key),
             _ => &[],
@@ -3076,7 +3076,7 @@ impl Paragraph {
         &self,
         leaf_key: Option<TextLeafKey>,
         fades: &[(Range<usize>, f32)],
-        backgrounds: &[(Range<usize>, Hsla)],
+        backgrounds: &[(Range<usize>, RangePaint)],
         node_cx: &NodeContext,
         cx: &mut App,
     ) -> Vec<InlineFlowItem> {
@@ -3330,11 +3330,13 @@ fn slice_fades(
 /// The range highlight backgrounds overlapping `start..end`, rebased to
 /// start at `start`.
 fn slice_backgrounds(
-    backgrounds: &[(Range<usize>, Hsla)],
+    backgrounds: &[(Range<usize>, RangePaint)],
     start: usize,
     end: usize,
-) -> Vec<(Range<usize>, Hsla)> {
-    slice_ranges(backgrounds, start, end, |range, color| (range, *color))
+) -> Vec<(Range<usize>, RangePaint)> {
+    slice_ranges(backgrounds, start, end, |range, paint| {
+        (range, paint.clone())
+    })
 }
 
 /// A table column's cell widths for layout, excluding the divider after it.

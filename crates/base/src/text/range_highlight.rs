@@ -21,8 +21,12 @@
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 use std::{
+    collections::HashMap,
     ops::Range,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 #[cfg(target_family = "wasm")]
@@ -171,14 +175,33 @@ impl PartialEq for RenderedText {
 
 impl Eq for RenderedText {}
 
-/// A background painted behind one range of a [`RenderedText`].
+/// A background painted behind one range of a [`RenderedText`], a line drawn
+/// under it, or both.
 ///
 /// It is painted under the text and under the selection, and never changes
 /// layout. Where highlights overlap, the later one paints over the earlier.
+/// A transparent background paints nothing, so a highlight can be a line
+/// alone.
+///
+/// A highlight given a [tag](Self::tag) reports where it was last painted,
+/// which [`TextViewState::range_highlight_bounds`] reads, so an application
+/// can place something beside the text, such as a note in a margin.
+///
+/// [`TextViewState::range_highlight_bounds`]: super::TextViewState::range_highlight_bounds
 #[derive(Clone, Debug, PartialEq)]
 pub struct RangeHighlight {
     range: Range<usize>,
     background: Hsla,
+    underline: Option<RangeUnderline>,
+    tag: Option<u64>,
+}
+
+/// A line under the text of a [`RangeHighlight`]'s range, 2 pixels thick,
+/// just below the glyphs: solid, or in dashes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RangeUnderline {
+    pub color: Hsla,
+    pub dashed: bool,
 }
 
 impl RangeHighlight {
@@ -187,7 +210,24 @@ impl RangeHighlight {
         Self {
             range,
             background: background.into(),
+            underline: None,
+            tag: None,
         }
+    }
+
+    /// Draws a line under the range's text too.
+    pub fn underline(mut self, color: impl Into<Hsla>, dashed: bool) -> Self {
+        self.underline = Some(RangeUnderline {
+            color: color.into(),
+            dashed,
+        });
+        self
+    }
+
+    /// Reports where the range is painted under `tag`.
+    pub fn tag(mut self, tag: u64) -> Self {
+        self.tag = Some(tag);
+        self
     }
 
     pub fn range(&self) -> Range<usize> {
@@ -196,6 +236,79 @@ impl RangeHighlight {
 
     pub fn background(&self) -> Hsla {
         self.background
+    }
+
+    pub fn underline_style(&self) -> Option<RangeUnderline> {
+        self.underline
+    }
+
+    pub fn tag_id(&self) -> Option<u64> {
+        self.tag
+    }
+}
+
+/// How one leaf's piece of a highlight paints, and where it reports its
+/// place when it has a tag.
+#[derive(Clone, Debug)]
+pub(crate) struct RangePaint {
+    pub(crate) background: Hsla,
+    pub(crate) underline: Option<RangeUnderline>,
+    pub(crate) place: Option<(u64, Arc<RangePlaces>)>,
+}
+
+impl RangePaint {
+    /// A plain background, as an editor's decorations paint.
+    pub(crate) fn fill(background: Hsla) -> Self {
+        Self {
+            background,
+            underline: None,
+            place: None,
+        }
+    }
+}
+
+/// Where each tagged highlight was painted, in window coordinates, gathered
+/// from the pieces its leaves painted.
+///
+/// The view starts a new generation each time it paints. A tag's pieces from
+/// an earlier generation are dropped when its first piece of a new one comes
+/// in, so a piece that no longer holds the range, as after a line wraps
+/// differently, doesn't linger in its bounds.
+#[derive(Debug, Default)]
+pub(crate) struct RangePlaces {
+    generation: AtomicU64,
+    places: Mutex<HashMap<u64, (u64, HashMap<u64, Bounds<Pixels>>)>>,
+}
+
+impl RangePlaces {
+    /// Called as the view begins to paint.
+    pub(crate) fn begin(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that `piece`, a piece of text painted this generation, holds
+    /// part of the highlight tagged `tag` within `bounds`.
+    pub(crate) fn record(&self, tag: u64, piece: u64, bounds: Bounds<Pixels>) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let Ok(mut places) = self.places.lock() else {
+            return;
+        };
+        let entry = places.entry(tag).or_default();
+        if entry.0 != generation {
+            *entry = (generation, HashMap::new());
+        }
+        entry.1.insert(piece, bounds);
+    }
+
+    /// The bounds of every piece the highlight tagged `tag` last painted.
+    pub(crate) fn bounds(&self, tag: u64) -> Option<Bounds<Pixels>> {
+        let places = self.places.lock().ok()?;
+        places
+            .get(&tag)?
+            .1
+            .values()
+            .copied()
+            .reduce(|all, piece| all.union(&piece))
     }
 }
 
@@ -597,7 +710,9 @@ fn paragraph_source_end(paragraph: &Paragraph) -> Option<usize> {
 pub(crate) struct RangeHighlightFrame {
     /// Sorted by key. A leaf's backgrounds keep the order the application
     /// gave them in, so a later one paints over an earlier one.
-    leaves: Vec<(TextLeafKey, Vec<(Range<usize>, Hsla)>)>,
+    leaves: Vec<(TextLeafKey, Vec<(Range<usize>, RangePaint)>)>,
+    /// Where the tagged highlights were painted, shared by every piece.
+    pub(crate) places: Arc<RangePlaces>,
 }
 
 impl RangeHighlightFrame {
@@ -606,33 +721,39 @@ impl RangeHighlightFrame {
         text: &RenderedText,
         highlights: impl IntoIterator<Item = RangeHighlight>,
     ) -> Result<Option<Self>, RangeHighlightError> {
+        let places = Arc::new(RangePlaces::default());
         let mut pieces = Vec::new();
         for (ix, highlight) in highlights.into_iter().enumerate() {
             let leaf_ranges = text
                 .index()
                 .resolve(&highlight.range)
                 .ok_or(RangeHighlightError::InvalidRange(ix))?;
+            let paint = RangePaint {
+                background: highlight.background,
+                underline: highlight.underline,
+                place: highlight.tag.map(|tag| (tag, places.clone())),
+            };
             pieces.extend(
                 leaf_ranges
                     .into_iter()
-                    .map(|(key, range)| (key, range, highlight.background)),
+                    .map(|(key, range)| (key, range, paint.clone())),
             );
         }
 
         // Stable, so each leaf keeps the application's order.
         pieces.sort_by_key(|(key, _, _)| *key);
-        let mut leaves: Vec<(TextLeafKey, Vec<(Range<usize>, Hsla)>)> = Vec::new();
-        for (key, range, background) in pieces {
+        let mut leaves: Vec<(TextLeafKey, Vec<(Range<usize>, RangePaint)>)> = Vec::new();
+        for (key, range, paint) in pieces {
             match leaves.last_mut() {
-                Some((last, backgrounds)) if *last == key => backgrounds.push((range, background)),
-                _ => leaves.push((key, vec![(range, background)])),
+                Some((last, paints)) if *last == key => paints.push((range, paint)),
+                _ => leaves.push((key, vec![(range, paint)])),
             }
         }
-        Ok((!leaves.is_empty()).then_some(Self { leaves }))
+        Ok((!leaves.is_empty()).then_some(Self { leaves, places }))
     }
 
-    /// The backgrounds of leaf `key`, in its rendered byte space.
-    pub(crate) fn backgrounds(&self, key: TextLeafKey) -> &[(Range<usize>, Hsla)] {
+    /// The highlights of leaf `key`, in its rendered byte space.
+    pub(crate) fn backgrounds(&self, key: TextLeafKey) -> &[(Range<usize>, RangePaint)] {
         self.leaves
             .binary_search_by_key(&key, |(leaf, _)| *leaf)
             .map_or(&[], |ix| self.leaves[ix].1.as_slice())
@@ -650,14 +771,17 @@ impl RangeHighlightFrame {
                 let clipped = backgrounds
                     .iter()
                     .filter(|(range, _)| range.start < unchanged)
-                    .map(|(range, background)| (range.start..range.end.min(unchanged), *background))
+                    .map(|(range, paint)| (range.start..range.end.min(unchanged), paint.clone()))
                     .collect::<Vec<_>>();
                 (!clipped.is_empty()).then_some((new_key, clipped))
             })
             .collect::<Vec<_>>();
         // Moving keys keeps their order, but stay safe for the binary search.
         leaves.sort_by_key(|(key, _)| *key);
-        (!leaves.is_empty()).then_some(Self { leaves })
+        (!leaves.is_empty()).then_some(Self {
+            leaves,
+            places: self.places.clone(),
+        })
     }
 }
 
@@ -822,7 +946,9 @@ mod tests {
 
     use gpui::{EntityId, hsla};
 
-    use super::{LeafRemap, RangeHighlight, RangeHighlightFrame, RenderedText, TextLeafKey};
+    use super::{
+        LeafRemap, RangeHighlight, RangeHighlightFrame, RangePaint, RenderedText, TextLeafKey,
+    };
     use crate::text::{
         document::ParsedDocument,
         format,
@@ -895,21 +1021,25 @@ mod tests {
             let new = parse(&changed);
             let remap = LeafRemap::new(&old, &new, false);
             assert_eq!(remap.table_rows.len(), rows + 1);
+            let color = hsla(0.15, 1., 0.5, 0.4);
             let frame = RangeHighlightFrame {
                 leaves: remap
                     .old_leaves
                     .iter()
-                    .map(|(key, _)| (*key, vec![(0..1, hsla(0.15, 1., 0.5, 0.4))]))
+                    .map(|(key, _)| (*key, vec![(0..1, RangePaint::fill(color))]))
                     .collect(),
+                places: Default::default(),
             };
             assert_eq!(frame.leaves.len(), (rows + 1) * columns);
             let kept = frame.remap(&remap).unwrap();
             assert_eq!(kept.leaves.len(), columns);
             for column in 0..columns {
-                assert_eq!(
-                    kept.backgrounds(TextLeafKey::table_cell(0, column)),
-                    &[(0..1, hsla(0.15, 1., 0.5, 0.4))],
-                );
+                let painted: Vec<_> = kept
+                    .backgrounds(TextLeafKey::table_cell(0, column))
+                    .iter()
+                    .map(|(range, paint)| (range.clone(), paint.background))
+                    .collect();
+                assert_eq!(painted, [(0..1, color)]);
             }
         }
     }

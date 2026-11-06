@@ -747,6 +747,23 @@ impl TextViewState {
         Ok(())
     }
 
+    /// Where the range highlight tagged `tag` was last painted, in window
+    /// coordinates: the bounds of every line of it that painted. `None` until
+    /// it has painted, and after the highlights are replaced until the new
+    /// ones have. A highlight that scrolled out of a [`Self::scrollable`]
+    /// view keeps the place it last painted at.
+    pub fn range_highlight_bounds(&self, tag: u64) -> Option<Bounds<Pixels>> {
+        self.range_highlights.as_ref()?.places.bounds(tag)
+    }
+
+    /// Starts a new paint of the highlights' places, which drops each tag's
+    /// pieces from earlier paints as its first new one comes in.
+    pub(crate) fn begin_range_places(&self) {
+        if let Some(frame) = &self.range_highlights {
+            frame.places.begin();
+        }
+    }
+
     /// Remove all range highlights.
     pub fn clear_range_highlights(&mut self, cx: &mut Context<Self>) {
         if self.range_highlights.take().is_some() {
@@ -3138,6 +3155,76 @@ mod tests {
             assert!(painted(&state, TextLeafKey::block(0), cx).is_empty());
             set(&state, [ranges[1].clone().unwrap()], cx).unwrap();
             assert_eq!(painted(&state, TextLeafKey::block(0), cx), [0..2, 4..6]);
+        }
+
+        /// A tagged highlight reports where it painted: each paragraph's
+        /// highlight sits on its own lines inside the view, the later one
+        /// below, and a line alone paints with no background behind it.
+        #[gpui::test]
+        fn a_tagged_highlight_reports_where_it_painted(cx: &mut TestAppContext) {
+            struct Root {
+                state: Entity<TextViewState>,
+            }
+
+            impl Render for Root {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    gpui::div()
+                        .w(px(300.))
+                        .child(crate::text::TextView::new(&self.state))
+                }
+            }
+
+            cx.update(crate::init);
+            let markdown = "first paragraph here\n\nsecond paragraph here";
+            let (root, cx) = cx.add_window_view(|_, cx| Root {
+                state: cx.new(|cx| TextViewState::markdown(markdown, cx)),
+            });
+            cx.run_until_parked();
+            let state = root.read_with(cx, |root, _| root.state.clone());
+            state.update(cx, |state, cx| {
+                let text = state.rendered_text();
+                let first = text.range_for_source(find(markdown, "first")).unwrap();
+                let second = text.range_for_source(find(markdown, "second")).unwrap();
+                let line = gpui::hsla(0.6, 0.7, 0.5, 1.);
+                state
+                    .set_range_highlights(
+                        [
+                            RangeHighlight::new(first, gpui::transparent_black())
+                                .underline(line, true)
+                                .tag(1),
+                            RangeHighlight::new(second, gpui::transparent_black())
+                                .underline(line, false)
+                                .tag(2),
+                        ],
+                        cx,
+                    )
+                    .unwrap();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let (view, first, second) = state.read_with(cx, |state, _| {
+                (
+                    state.bounds(),
+                    state.range_highlight_bounds(1).expect("the first painted"),
+                    state.range_highlight_bounds(2).expect("the second painted"),
+                )
+            });
+            assert!(view.contains(&first.origin), "{first:?} in {view:?}");
+            assert!(
+                second.top() >= first.bottom(),
+                "the second paragraph's highlight is below the first's: {first:?}, {second:?}"
+            );
+            assert!(first.size.width > px(0.) && first.size.width < view.size.width);
+            assert_eq!(
+                state.read_with(cx, |state, _| state.range_highlight_bounds(3)),
+                None,
+                "an untagged place is unknown"
+            );
+            // Another paint reports the same place, not an ever-growing one.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                state.read_with(cx, |state, _| state.range_highlight_bounds(1)),
+                Some(first)
+            );
         }
 
         #[gpui::test]

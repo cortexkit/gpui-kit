@@ -18,7 +18,7 @@ use std::{
 use gpui::{
     App, BorderStyle, Bounds, ClickEvent, CursorStyle, Edges, Element, ElementId,
     ForegroundExecutor, Global, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior,
-    Hsla, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseClickEvent, MouseDownEvent,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseClickEvent, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyleRefinement, StyledText, Task,
     TextAlign, TextLayout, TextRun, TextStyle, Window, point, px, quad, size,
 };
@@ -29,7 +29,7 @@ use crate::{
     input::Selection,
     text::TextViewMultiClickKind,
     text::node::LinkMark,
-    text::range_highlight::RevealAt,
+    text::range_highlight::{RangePaint, RangeUnderline, RevealAt},
     text::selection::word_range_at,
     text::state::LineSpan,
     text::text_view::{LinkClickHandlerFn, handle_link_click},
@@ -322,7 +322,7 @@ pub(super) struct Inline {
     selection_bounds: Option<Bounds<Pixels>>,
     selection_source: Option<(Arc<Mutex<InlineState>>, Range<usize>)>,
     /// Range highlight backgrounds, painted behind the text.
-    range_backgrounds: Vec<(Range<usize>, Hsla)>,
+    range_backgrounds: Vec<(Range<usize>, RangePaint)>,
     /// The start of a pending reveal, when it is in this text.
     reveal: Option<RevealAt>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
@@ -634,7 +634,7 @@ impl Inline {
                         .into_iter()
                         .filter_map(|(range, color)| {
                             let (lo, hi) = (range.start.max(start), range.end.min(end));
-                            (lo < hi).then(|| (lo - start..hi - start, color))
+                            (lo < hi).then(|| (lo - start..hi - start, RangePaint::fill(color)))
                         }),
                 );
             return;
@@ -643,7 +643,11 @@ impl Inline {
             return;
         };
         sink.report(key, self.styled_text.layout());
-        self.range_backgrounds.extend(sink.backgrounds(key));
+        self.range_backgrounds.extend(
+            sink.backgrounds(key)
+                .into_iter()
+                .map(|(range, color)| (range, RangePaint::fill(color))),
+        );
     }
 
     /// Hands the shaped text to the next frame (see [`RetainedLayout`]).
@@ -758,7 +762,10 @@ impl Inline {
 
     /// Paint `backgrounds` behind the text. They are not part of the text
     /// runs, so changing them does not shape the text again.
-    pub(super) fn range_backgrounds(mut self, backgrounds: Vec<(Range<usize>, Hsla)>) -> Self {
+    pub(super) fn range_backgrounds(
+        mut self,
+        backgrounds: Vec<(Range<usize>, RangePaint)>,
+    ) -> Self {
         self.range_backgrounds = backgrounds;
         self
     }
@@ -1090,26 +1097,87 @@ impl Inline {
         }
     }
 
-    /// Paint each range highlight behind the text of its range.
+    /// Paint each range highlight behind the text of its range: its
+    /// background and the line under it, and report where a tagged one is.
     fn paint_range_highlights(&self, text_layout: &TextLayout, window: &mut Window) {
+        let text_style = window.text_style();
         let glyphs = glyph_boxes(
             text_layout,
-            window.text_style().text_align,
+            text_style.text_align,
             text_layout.bounds().size.width,
         );
         let origin = text_layout.bounds().origin;
         let line_height = text_layout.line_height();
-        for (range, color) in &self.range_backgrounds {
+        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let piece = self.piece_key();
+        for (range, paint) in &self.range_backgrounds {
+            let mut painted: Option<Bounds<Pixels>> = None;
             for (row, left, right) in range_boxes(&glyphs, range.clone()) {
-                window.paint_quad(gpui::fill(
-                    Bounds::from_corners(
-                        point(origin.x + left, origin.y + line_height * row as f32),
-                        point(origin.x + right, origin.y + line_height * (row + 1) as f32),
-                    ),
-                    *color,
-                ));
+                let bounds = Bounds::from_corners(
+                    point(origin.x + left, origin.y + line_height * row as f32),
+                    point(origin.x + right, origin.y + line_height * (row + 1) as f32),
+                );
+                if !paint.background.is_transparent() {
+                    window.paint_quad(gpui::fill(bounds, paint.background));
+                }
+                if let Some(underline) = paint.underline {
+                    paint_underline(bounds, font_size, underline, window);
+                }
+                painted = Some(painted.map_or(bounds, |all| all.union(&bounds)));
+            }
+            if let (Some((tag, places)), Some(bounds)) = (&paint.place, painted) {
+                places.record(*tag, piece, bounds);
             }
         }
+    }
+
+    /// Names this piece of text among those painting one view: its element's
+    /// id, and the key it reports a highlight's place under in
+    /// [`RangePlaces`](super::range_highlight::RangePlaces).
+    fn piece_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::default();
+        (Arc::as_ptr(&self.state) as usize).hash(&mut hasher);
+        self.selection_source
+            .as_ref()
+            .map(|(_, range)| range.start)
+            .hash(&mut hasher);
+        self.editor_piece.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// How long each dash of a dashed underline is, and the gap after it.
+const DASH: f32 = 4.;
+const DASH_GAP: f32 = 3.;
+
+/// Draws `underline` under the glyphs of one line's piece, `bounds` being the
+/// piece's whole line box: 2 pixels thick, 1 pixel below the font's em box,
+/// which sits centred in the line.
+fn paint_underline(
+    bounds: Bounds<Pixels>,
+    font_size: Pixels,
+    underline: RangeUnderline,
+    window: &mut Window,
+) {
+    let thickness = px(2.);
+    let em_bottom = bounds.top() + (bounds.size.height + font_size) / 2.;
+    let top = (em_bottom + px(1.)).min(bounds.bottom() - thickness);
+    let line = |left: Pixels, right: Pixels| {
+        gpui::fill(
+            Bounds::from_corners(point(left, top), point(right, top + thickness)),
+            underline.color,
+        )
+    };
+    if !underline.dashed {
+        window.paint_quad(line(bounds.left(), bounds.right()));
+        return;
+    }
+    let mut left = bounds.left();
+    while left < bounds.right() {
+        let right = (left + px(DASH)).min(bounds.right());
+        window.paint_quad(line(left, right));
+        left = right + px(DASH_GAP);
     }
 }
 
@@ -1163,15 +1231,7 @@ impl Element for Inline {
     /// so the id stays the same for as long as the text is shown; the
     /// fragment's start tells apart pieces of one wrapped line.
     fn id(&self) -> Option<ElementId> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::hash::DefaultHasher::default();
-        (Arc::as_ptr(&self.state) as usize).hash(&mut hasher);
-        self.selection_source
-            .as_ref()
-            .map(|(_, range)| range.start)
-            .hash(&mut hasher);
-        self.editor_piece.hash(&mut hasher);
-        Some(ElementId::NamedInteger("text".into(), hasher.finish()))
+        Some(ElementId::NamedInteger("text".into(), self.piece_key()))
     }
 
     /// Plain text is one piece of static text. Text with links is a group of
