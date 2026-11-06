@@ -394,13 +394,21 @@ impl CommandState {
                 CommandEntry::Group(group) => {
                     let section_ix = group_ix + usize::from(has_ungrouped_items);
                     group_ix += 1;
-                    let visible = group
+                    let mut visible = group
                         .items
                         .iter()
                         .enumerate()
                         .filter(|(_, item)| self.item_matches(item, query))
                         .map(|(item_ix, item)| (item_ix, item.is_disabled()))
                         .collect::<Vec<_>>();
+                    // While filtering, the group's best matches come first,
+                    // in the group's order among equals: an item named by
+                    // the query before one that only mentions it.
+                    if self.model.searchable && self.model.filterable && !query.is_empty() {
+                        visible.sort_by_key(|(item_ix, _)| {
+                            group.items[*item_ix].match_rank(query).unwrap_or(u8::MAX)
+                        });
+                    }
 
                     if visible.is_empty() {
                         continue;
@@ -1717,6 +1725,47 @@ mod tests {
 
                 assert_eq!(state.matched_count(), 5);
                 assert_eq!(state.selected_index(), Some(IndexPath::new(0).section(0)));
+            });
+        });
+    }
+
+    /// Within a group, an item the query names comes before items that only
+    /// mention it in their keywords, whatever the group's order.
+    #[gpui::test]
+    fn a_groups_named_match_comes_before_its_keyword_matches(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, cx| {
+            let state = cx.new(|cx| {
+                command_state(
+                    window,
+                    cx,
+                    [CommandEntry::Group(
+                        CommandGroup::new()
+                            .label("Agents")
+                            .item(
+                                CommandItem::new()
+                                    .label("Show CKE2E")
+                                    .keywords(["CI green since Broca's scope change"]),
+                            )
+                            .item(
+                                CommandItem::new()
+                                    .label("Show ASTRO")
+                                    .keywords(["waiting on BROCA"]),
+                            )
+                            .item(CommandItem::new().label("Show BROCA")),
+                    )],
+                )
+            });
+
+            state.update(cx, |state, cx| {
+                state.set_query("broca", window, cx);
+                state.update_matches(cx);
+                let labels: Vec<_> = (0..state.matched_count())
+                    .map(|ix| state.item_at(ix).unwrap().label_text().unwrap().clone())
+                    .collect();
+                assert_eq!(labels, ["Show BROCA", "Show CKE2E", "Show ASTRO"]);
             });
         });
     }

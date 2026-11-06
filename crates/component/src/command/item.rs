@@ -127,6 +127,42 @@ impl CommandItem {
                 .any(|keyword| keyword.to_lowercase().contains(&query))
     }
 
+    /// How well this item matches `query`, lower first: 0 where the label has
+    /// a word starting with it, 1 where the label holds it elsewhere, 2 where
+    /// only a keyword holds it. None where nothing does. An empty query ranks
+    /// every item 0.
+    ///
+    /// A palette lists a group's matches in this order, so what a person
+    /// typed the name of comes before items that only mention it in their
+    /// keywords.
+    pub(crate) fn match_rank(&self, query: &str) -> Option<u8> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let query = query.to_lowercase();
+        if let Some(label) = &self.label {
+            let label = label.to_lowercase();
+            let mut held = false;
+            for (at, _) in label.match_indices(&query) {
+                held = true;
+                let starts_word = label[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|before| !before.is_alphanumeric());
+                if starts_word {
+                    return Some(0);
+                }
+            }
+            if held {
+                return Some(1);
+            }
+        }
+        self.keywords
+            .iter()
+            .any(|keyword| keyword.to_lowercase().contains(&query))
+            .then_some(2)
+    }
+
     pub(crate) fn label_text(&self) -> Option<&SharedString> {
         self.label.as_ref()
     }
@@ -338,6 +374,20 @@ mod tests {
             CommandItem::new().label("Calendar").label_text(),
             Some(&"Calendar".into())
         );
+    }
+
+    #[test]
+    fn ranks_a_word_in_the_label_before_the_label_and_the_label_before_keywords() {
+        let named = CommandItem::new().label("Show BROCA");
+        let inside = CommandItem::new()
+            .label("Show CKE2E")
+            .keywords(["green since Broca's change"]);
+        let within = CommandItem::new().label("Embrocation");
+        assert_eq!(named.match_rank("broca"), Some(0));
+        assert_eq!(within.match_rank("broca"), Some(1));
+        assert_eq!(inside.match_rank("broca"), Some(2));
+        assert_eq!(named.match_rank("quota"), None);
+        assert_eq!(inside.match_rank(""), Some(0));
     }
 
     #[test]
