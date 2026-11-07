@@ -154,6 +154,167 @@ fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
     groups
 }
 
+/// Every element name HTML defines, sorted: the current ones and the
+/// obsolete ones browsers still draw. A tag with any other name, such as
+/// `<prompt>` or `<filepath>` written as a placeholder in a message, was never
+/// meant as HTML by whoever wrote it, so the view shows it as written instead
+/// of parsing it into an element with nothing to draw.
+const HTML_ELEMENTS: &[&str] = &[
+    "a",
+    "abbr",
+    "acronym",
+    "address",
+    "area",
+    "article",
+    "aside",
+    "audio",
+    "b",
+    "base",
+    "bdi",
+    "bdo",
+    "big",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "canvas",
+    "caption",
+    "center",
+    "cite",
+    "code",
+    "col",
+    "colgroup",
+    "data",
+    "datalist",
+    "dd",
+    "del",
+    "details",
+    "dfn",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "font",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "i",
+    "iframe",
+    "img",
+    "input",
+    "ins",
+    "kbd",
+    "label",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "map",
+    "mark",
+    "marquee",
+    "menu",
+    "meta",
+    "meter",
+    "nav",
+    "nobr",
+    "noscript",
+    "object",
+    "ol",
+    "optgroup",
+    "option",
+    "output",
+    "p",
+    "param",
+    "picture",
+    "pre",
+    "progress",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "s",
+    "samp",
+    "script",
+    "search",
+    "section",
+    "select",
+    "slot",
+    "small",
+    "source",
+    "span",
+    "strike",
+    "strong",
+    "style",
+    "sub",
+    "summary",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "time",
+    "title",
+    "tr",
+    "track",
+    "tt",
+    "u",
+    "ul",
+    "var",
+    "video",
+    "wbr",
+];
+
+/// The element names of the tags in `html`, lowercased: each `<name` or
+/// `</name`, skipping comments, declarations and processing instructions.
+fn html_tag_names(html: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = html;
+    while let Some(at) = rest.find('<') {
+        rest = &rest[at + 1..];
+        let after = rest.strip_prefix('/').unwrap_or(rest);
+        if !after.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        let len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(after.len());
+        names.push(after[..len].to_ascii_lowercase());
+    }
+    names
+}
+
+/// Whether `html` is made only of tags that aren't HTML elements, with the
+/// text between them, so it shows as the text it was written as.
+fn only_unknown_tags(html: &str) -> bool {
+    let names = html_tag_names(html);
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|name| HTML_ELEMENTS.binary_search(&name.as_str()).is_err())
+}
+
 fn inline_html_tag(node: &Node) -> Option<(bool, String, &str)> {
     let Node::Html(html) = node else {
         return None;
@@ -901,6 +1062,10 @@ fn parse_paragraph(
                     .marks(vec![(0..text.len(), TextMark::default())]),
             );
         }
+        Node::Html(val) if only_unknown_tags(&val.value) => {
+            text = val.value.clone();
+            paragraph.push(mapped_inline(source, text.clone(), node, cx));
+        }
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => {
                 if let Some(inline_text) =
@@ -1095,6 +1260,22 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
             BlockNode::CodeBlock(
                 CodeBlock::new(val.value.into(), None, span).source_segments(segments),
             )
+        }
+        // A block made only of tags that aren't HTML elements shows as
+        // written, line breaks and all, rather than as an element that
+        // draws nothing but its text.
+        Node::Html(val) if only_unknown_tags(&val.value) => {
+            let span = new_span(val.position, cx);
+            let segments = code_source_segments(source, &val.value, span, cx.offset);
+            let len = val.value.len();
+            let mut paragraph = Paragraph::default();
+            paragraph.push(
+                InlineNode::new(val.value)
+                    .source_segments(segments)
+                    .marks(vec![(0..len, TextMark::default())]),
+            );
+            paragraph.span = span;
+            BlockNode::Paragraph(paragraph)
         }
         Node::Html(val) => match super::html::parse(&val.value, cx) {
             Ok(el) => BlockNode::Root {
@@ -2490,6 +2671,36 @@ mod tests {
         };
         assert_eq!(marked(|mark| mark.italic), ["c", "d", "g"]);
         assert_eq!(marked(|mark| mark.strikethrough), ["h"]);
+    }
+
+    /// A tag that isn't an HTML element, such as a placeholder someone typed
+    /// in a message, shows as written, inline or on a line of its own, while
+    /// HTML elements still render.
+    #[test]
+    fn tags_that_arent_html_elements_show_as_written() {
+        let text = |source: &str| {
+            let mut cx = NodeContext::default();
+            parse(source, &mut cx).unwrap().text()
+        };
+        assert_eq!(text("a <prompt> b"), "a <prompt> b\n");
+        assert_eq!(
+            text(r#"gemini-api analyze -i <filepath> "<prompt>""#),
+            "gemini-api analyze -i <filepath> \"<prompt>\"\n"
+        );
+        assert_eq!(
+            text("close </prompt> and <x y=\"1\"/> stay"),
+            "close </prompt> and <x y=\"1\"/> stay\n"
+        );
+        let block = text("Before\n\n<prompt>\nwhat to ask\n</prompt>\n\nAfter");
+        assert!(
+            block.contains("<prompt>\nwhat to ask\n</prompt>"),
+            "the block lost its tags or lines: {block:?}"
+        );
+        assert_eq!(text("<b>bold</b> and x<br>y"), "bold and x\ny\n");
+        assert!(
+            HTML_ELEMENTS.windows(2).all(|pair| pair[0] < pair[1]),
+            "HTML_ELEMENTS must stay sorted for its binary search"
+        );
     }
 
     fn highlight_runs(paragraph: &Paragraph) -> Vec<(String, gpui::Hsla)> {
