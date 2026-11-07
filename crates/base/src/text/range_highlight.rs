@@ -300,6 +300,29 @@ impl RangePlaces {
         entry.1.insert(piece, bounds);
     }
 
+    /// Places that start from `earlier`'s, for the tags `keep` names: their
+    /// last painted pieces stand until the next paint replaces them. The
+    /// generation carries on from `earlier`'s, so that next paint replaces
+    /// them rather than adding to them.
+    pub(crate) fn carried(earlier: &RangePlaces, keep: impl Fn(u64) -> bool) -> Self {
+        let generation = earlier.generation.load(Ordering::Relaxed);
+        let places = earlier
+            .places
+            .lock()
+            .map(|places| {
+                places
+                    .iter()
+                    .filter(|(tag, _)| keep(**tag))
+                    .map(|(tag, entry)| (*tag, entry.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            generation: AtomicU64::new(generation),
+            places: Mutex::new(places),
+        }
+    }
+
     /// The bounds of every piece the highlight tagged `tag` last painted.
     pub(crate) fn bounds(&self, tag: u64) -> Option<Bounds<Pixels>> {
         let places = self.places.lock().ok()?;
@@ -713,15 +736,39 @@ pub(crate) struct RangeHighlightFrame {
     leaves: Vec<(TextLeafKey, Vec<(Range<usize>, RangePaint)>)>,
     /// Where the tagged highlights were painted, shared by every piece.
     pub(crate) places: Arc<RangePlaces>,
+    /// Each tagged highlight's range in the rendered text it was set on.
+    /// Empty once the text has changed under it, since the ranges then no
+    /// longer say what the highlights cover.
+    tagged: HashMap<u64, Range<usize>>,
 }
 
 impl RangeHighlightFrame {
     /// Validates `highlights` against `text` and resolves them to leaves.
+    ///
+    /// A tagged highlight set again over the same range as in `earlier`, the
+    /// frame it replaces, keeps the place it last painted at until it paints
+    /// again. Only its look changed, as when an application marks the one the
+    /// pointer is over, so where it sits is still known; forgetting it for a
+    /// frame would let anything placed beside it jump.
     pub(super) fn new(
         text: &RenderedText,
         highlights: impl IntoIterator<Item = RangeHighlight>,
+        earlier: Option<&RangeHighlightFrame>,
     ) -> Result<Option<Self>, RangeHighlightError> {
-        let places = Arc::new(RangePlaces::default());
+        let highlights: Vec<RangeHighlight> = highlights.into_iter().collect();
+        let tagged: HashMap<u64, Range<usize>> = highlights
+            .iter()
+            .filter_map(|highlight| Some((highlight.tag?, highlight.range.clone())))
+            .collect();
+        let places = Arc::new(match earlier {
+            Some(earlier) => RangePlaces::carried(&earlier.places, |tag| {
+                earlier
+                    .tagged
+                    .get(&tag)
+                    .is_some_and(|range| tagged.get(&tag) == Some(range))
+            }),
+            None => RangePlaces::default(),
+        });
         let mut pieces = Vec::new();
         for (ix, highlight) in highlights.into_iter().enumerate() {
             let leaf_ranges = text
@@ -749,7 +796,11 @@ impl RangeHighlightFrame {
                 _ => leaves.push((key, vec![(range, paint)])),
             }
         }
-        Ok((!leaves.is_empty()).then_some(Self { leaves, places }))
+        Ok((!leaves.is_empty()).then_some(Self {
+            leaves,
+            places,
+            tagged,
+        }))
     }
 
     /// The highlights of leaf `key`, in its rendered byte space.
@@ -781,6 +832,7 @@ impl RangeHighlightFrame {
         (!leaves.is_empty()).then_some(Self {
             leaves,
             places: self.places.clone(),
+            tagged: HashMap::new(),
         })
     }
 }
@@ -1029,6 +1081,7 @@ mod tests {
                     .map(|(key, _)| (*key, vec![(0..1, RangePaint::fill(color))]))
                     .collect(),
                 places: Default::default(),
+                tagged: Default::default(),
             };
             assert_eq!(frame.leaves.len(), (rows + 1) * columns);
             let kept = frame.remap(&remap).unwrap();

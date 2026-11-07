@@ -698,7 +698,9 @@ impl TextViewState {
             return Err(RangeHighlightError::Unsupported);
         }
         let text = self.rendered_text();
-        self.range_highlights = RangeHighlightFrame::new(&text, highlights)?.map(Arc::new);
+        self.range_highlights =
+            RangeHighlightFrame::new(&text, highlights, self.range_highlights.as_deref())?
+                .map(Arc::new);
         cx.notify();
         Ok(())
     }
@@ -749,9 +751,11 @@ impl TextViewState {
 
     /// Where the range highlight tagged `tag` was last painted, in window
     /// coordinates: the bounds of every line of it that painted. `None` until
-    /// it has painted, and after the highlights are replaced until the new
-    /// ones have. A highlight that scrolled out of a [`Self::scrollable`]
-    /// view keeps the place it last painted at.
+    /// it has painted. Replacing the highlights keeps the place of one set
+    /// again with the same tag over the same range, so restyling a highlight
+    /// doesn't lose where it is; any other is `None` until the new ones have
+    /// painted. A highlight that scrolled out of a [`Self::scrollable`] view
+    /// keeps the place it last painted at.
     pub fn range_highlight_bounds(&self, tag: u64) -> Option<Bounds<Pixels>> {
         self.range_highlights.as_ref()?.places.bounds(tag)
     }
@@ -3224,6 +3228,47 @@ mod tests {
             assert_eq!(
                 state.read_with(cx, |state, _| state.range_highlight_bounds(1)),
                 Some(first)
+            );
+            // Setting the highlights again keeps the place of the one restyled
+            // over the same range and forgets the one moved to another range
+            // until it paints there. Both are read in the same update as the
+            // setting, before any paint could report them afresh.
+            let (restyled, moved) = cx.update(|_, cx| {
+                state.update(cx, |state, cx| {
+                    let text = state.rendered_text();
+                    let first = text.range_for_source(find(markdown, "first")).unwrap();
+                    let moved = text.range_for_source(find(markdown, "paragraph")).unwrap();
+                    let wash = gpui::hsla(0.6, 0.7, 0.5, 0.12);
+                    state
+                        .set_range_highlights(
+                            [
+                                RangeHighlight::new(first, wash).tag(1),
+                                RangeHighlight::new(moved, gpui::transparent_black()).tag(2),
+                            ],
+                            cx,
+                        )
+                        .unwrap();
+                    (
+                        state.range_highlight_bounds(1),
+                        state.range_highlight_bounds(2),
+                    )
+                })
+            });
+            assert_eq!(
+                restyled,
+                Some(first),
+                "restyling a highlight forgot where it painted"
+            );
+            assert_eq!(
+                moved, None,
+                "a highlight moved to another range kept its old place"
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(
+                state
+                    .read_with(cx, |state, _| state.range_highlight_bounds(2))
+                    .is_some_and(|moved| moved.top() < second.top()),
+                "the moved highlight didn't report its new place"
             );
         }
 
