@@ -1371,6 +1371,34 @@ impl TouchSelection {
     }
 }
 
+/// Where surfaces that act on the selection, such as a toolbar an app shows
+/// over it, were painted: this frame and the frame before, since a press
+/// arrives between frames. A press there acts on the selection, so it must
+/// not clear it, whichever way the selection was made.
+#[derive(Default)]
+struct SelectionActions {
+    bounds: Vec<Bounds<Pixels>>,
+    previous: Vec<Bounds<Pixels>>,
+}
+
+impl SelectionActions {
+    fn covers(&self, position: Point<Pixels>) -> bool {
+        self.bounds
+            .iter()
+            .chain(&self.previous)
+            .any(|bounds| bounds.contains(&position))
+    }
+
+    fn painted_any(&self) -> bool {
+        !self.bounds.is_empty() || !self.previous.is_empty()
+    }
+
+    /// A new frame begins: what was painted last frame is kept one frame more.
+    fn begin_frame(&mut self) {
+        self.previous = std::mem::take(&mut self.bounds);
+    }
+}
+
 /// Automatic order is committed only after all live TextViews have painted.
 /// A partial frame is a subsequence of that order, not a new document.
 #[derive(Default)]
@@ -1418,6 +1446,7 @@ struct WindowSelectionState {
     /// bounces stretch and snap back on every tick.
     auto_scroll_stall: (Option<(Bounds<Pixels>, Point<Pixels>)>, u8),
     touch: TouchSelection,
+    actions: SelectionActions,
     /// This entity, so that touch changes can notify observers from paths that
     /// only hold an [`App`].
     entity_id: Option<EntityId>,
@@ -3035,6 +3064,17 @@ impl TextSelection {
         }
     }
 
+    /// Records where a surface that acts on the selection is painted this
+    /// frame, such as a toolbar shown over a mouse selection, so that
+    /// pressing it does not clear the selection it acts on. Call from paint,
+    /// every frame the surface is shown. [`Self::register_touch_ui`] does
+    /// the same for the touch edit menu, only while a touch selection holds.
+    pub fn register_selection_action(bounds: Bounds<Pixels>, window: &Window, cx: &mut App) {
+        if let Some(state) = WindowSelectionState::existing(window, cx) {
+            state.update(cx, |state, _| state.actions.bounds.push(bounds));
+        }
+    }
+
     /// Closes the edit menu and keeps the selection with its handles.
     pub fn close_edit_menu(window: &mut Window, cx: &mut App) {
         if let Some(state) = live_text_selection_state(window, cx) {
@@ -3256,6 +3296,9 @@ impl Element for TextSelectionLayer {
         if state.read(cx).touch.painted_any() {
             state.update(cx, |state, _| state.touch.begin_frame());
         }
+        if state.read(cx).actions.painted_any() {
+            state.update(cx, |state, _| state.actions.begin_frame());
+        }
         TextSelectionLayerPrepaintState(state)
     }
 
@@ -3390,9 +3433,11 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
         let Some(state) = mouse_down_state.upgrade() else {
             return;
         };
-        // A press on a handle or on the edit menu acts on the selection; it
-        // must not clear it.
-        if state.read(cx).touch.covers(event.position) {
+        // A press on a handle, on the edit menu or on a surface an app shows
+        // to act on the selection acts on it; it must not clear it.
+        if state.read(cx).touch.covers(event.position)
+            || state.read(cx).actions.covers(event.position)
+        {
             return;
         }
         if phase.capture() {
@@ -5950,6 +5995,80 @@ mod tests {
             let _ = window.draw(cx);
             TextSelection::selected_text(window, cx)
         })
+    }
+
+    /// Texts, and a bar under them that registers itself as acting on the
+    /// selection, as an app's toolbar over a selection would.
+    struct ActionBarView;
+
+    impl Render for ActionBarView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(TextSelectionLayer)
+                .child(
+                    div()
+                        .w(px(400.))
+                        .child(crate::SelectableText::new("text", "one two three")),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(200.))
+                        .left_0()
+                        .w(px(100.))
+                        .h(px(30.))
+                        .child(
+                            gpui::canvas(
+                                |_, _, _| {},
+                                |bounds, _, window, cx| {
+                                    TextSelection::register_selection_action(bounds, window, cx)
+                                },
+                            )
+                            .size_full(),
+                        ),
+                )
+        }
+    }
+
+    /// A press on a surface registered as acting on the selection keeps a
+    /// selection made with the mouse; a press anywhere else clears it.
+    #[gpui::test]
+    fn a_press_on_a_selection_action_keeps_the_selection(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| ActionBarView);
+        painted_selection(cx);
+        press_at("one two three", 4, 1, false, cx);
+        assert_eq!(drag_to("one two three", 13, cx), "two three");
+        release(1, cx);
+        assert_eq!(painted_selection(cx), "two three");
+
+        let click = |position: Point<Pixels>, cx: &mut gpui::VisualTestContext| {
+            cx.simulate_event(MouseDownEvent {
+                position,
+                modifiers: gpui::Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                position,
+                modifiers: gpui::Modifiers::default(),
+                button: MouseButton::Left,
+                click_count: 1,
+            });
+        };
+        click(point(px(50.), px(215.)), cx);
+        assert_eq!(
+            painted_selection(cx),
+            "two three",
+            "a press on the action cleared the selection"
+        );
+        click(point(px(300.), px(300.)), cx);
+        assert_eq!(
+            painted_selection(cx),
+            "",
+            "a press elsewhere kept the selection"
+        );
     }
 
     #[gpui::test]
