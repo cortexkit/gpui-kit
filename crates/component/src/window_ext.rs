@@ -116,6 +116,17 @@ pub trait WindowExt: Sized {
     /// another dialog sits over it.
     fn active_dialog_count(&mut self, cx: &mut App) -> usize;
 
+    /// The ids of the active dialogs, the bottom one first. A dialog playing
+    /// its exit transition isn't listed. An id stays the same while its dialog
+    /// is open and is never given to another dialog in this window, and the
+    /// dialog just opened is the last.
+    ///
+    /// An app that needs to know which of its dialogs are still open, however
+    /// each one closed (Escape, its close button, a click outside, or
+    /// [`Self::close_dialog`]), can note the last id after opening one and
+    /// look for it here.
+    fn open_dialog_ids(&mut self, cx: &mut App) -> Vec<usize>;
+
     /// Closes the last active Dialog.
     fn close_dialog(&mut self, cx: &mut App);
 
@@ -215,6 +226,16 @@ impl WindowExt for Window {
             .iter()
             .filter(|dialog| !dialog.closing)
             .count()
+    }
+
+    #[inline]
+    fn open_dialog_ids(&mut self, cx: &mut App) -> Vec<usize> {
+        WindowState::read(self, cx)
+            .active_dialogs
+            .iter()
+            .filter(|dialog| !dialog.closing)
+            .map(|dialog| dialog.id)
+            .collect()
     }
 
     #[inline]

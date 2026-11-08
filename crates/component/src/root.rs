@@ -55,7 +55,7 @@ pub(crate) struct ActiveSheet {
 #[derive(Clone)]
 pub(crate) struct ActiveDialog {
     /// Stable for the dialog's lifetime, independently of its stack position.
-    id: usize,
+    pub(crate) id: usize,
     focus_handle: FocusHandle,
     /// The previous focused handle before opening the Dialog.
     previous_focused_handle: Option<WeakFocusHandle>,

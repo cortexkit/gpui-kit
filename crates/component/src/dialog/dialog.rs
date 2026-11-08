@@ -1241,6 +1241,39 @@ pub(crate) mod tests {
         });
     }
 
+    /// Each open dialog keeps its id, bottom first, the newest last; one
+    /// on its way out drops out of the list, and a dialog opened later never
+    /// takes an id given before.
+    #[gpui::test]
+    fn open_dialog_ids_list_the_open_dialogs_bottom_first(cx: &mut TestAppContext) {
+        let cx = window(cx, size(px(1000.), px(800.)));
+        cx.update(|_, cx| cx.set_reduce_motion(false));
+        let ids = |cx: &mut VisualTestContext| cx.update(|window, cx| window.open_dialog_ids(cx));
+        assert!(ids(cx).is_empty());
+        open(cx, |dialog, _, _| dialog.title("First").child("body"));
+        let first = ids(cx);
+        open(cx, |dialog, _, _| dialog.title("Second").child("body"));
+        let both = ids(cx);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], first[0], "the bottom dialog kept its id");
+        cx.background_executor.advance_clock(*ANIMATION_DURATION);
+        frame(cx);
+        cx.update(|window, cx| window.close_dialog(cx));
+        frame(cx);
+        assert_eq!(
+            ids(cx),
+            first,
+            "the closing top dialog is still mounted for its exit but isn't listed"
+        );
+        open(cx, |dialog, _, _| dialog.title("Third").child("body"));
+        let now = ids(cx);
+        assert_eq!(now.len(), 2);
+        assert!(
+            !both.contains(&now[1]),
+            "the new dialog took an id given before"
+        );
+    }
+
     #[gpui::test]
     fn reopening_during_the_exit_keeps_the_new_dialog(cx: &mut TestAppContext) {
         let cx = window(cx, size(px(1000.), px(800.)));
