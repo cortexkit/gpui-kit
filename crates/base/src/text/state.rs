@@ -24,8 +24,7 @@ use crate::{
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, LinkFilterFn,
         MarkdownExtensions, RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn,
-        TaskToggleHandlerFn,
-        TextViewStyle,
+        TaskToggleHandlerFn, TextViewStyle,
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
