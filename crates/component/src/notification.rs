@@ -26,7 +26,6 @@ use crate::{
     styled::toast_shadow,
     v_flex,
 };
-use rust_i18n::t;
 
 const NOTIFICATION_TRANSITION_DURATION: Duration = Duration::from_millis(400);
 const NOTIFICATION_EXIT_DURATION: Duration = Duration::from_millis(200);
