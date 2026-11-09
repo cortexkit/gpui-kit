@@ -1007,11 +1007,10 @@ impl TextSelectionHandle {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let window_id = window.window_handle().window_id();
-        if let Some(scope) = current_text_selection_scope(window_id, cx) {
+        if let Some(scope) = marker_around::<TextSelectionScopeId>(window, cx) {
             registration.scope = scope;
         }
-        if let Some(region) = current_marker::<TextSelectionRegionId>(window_id, cx) {
+        if let Some(region) = marker_around::<TextSelectionRegionId>(window, cx) {
             registration.region = Some(region);
         }
         let Some(state) = WindowSelectionState::existing(window, cx) else {
@@ -2953,6 +2952,81 @@ fn current_marker<T: Copy + 'static>(window_id: gpui::WindowId, cx: &App) -> Opt
         .and_then(|stack| stack.last().copied())
 }
 
+/// Per window, where each marker of one kind was last drawn: the global
+/// element id of the element it wraps, when that element has an id.
+///
+/// A marker sets what the text inside it registers with while the marker's
+/// own element draws ([`MarkerStacks`]). GPUI Fast can draw a view again on
+/// its own, and draws some text twice in a frame, without the elements
+/// around it running, so the marker isn't on the stack then. The element id
+/// path is restored in that case, so the text finds its marker by path.
+/// An entry stays until its marker is drawn somewhere else; markers are few
+/// and long-lived, such as one per pane or dialog.
+struct MarkerPaths<T>(HashMap<gpui::WindowId, Vec<(GlobalElementId, T)>>);
+
+impl<T> Default for MarkerPaths<T> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<T: 'static> Global for MarkerPaths<T> {}
+
+/// Notes that `marker` wraps the element `path` in `window_id`. The global
+/// is written only when this changes it, so drawing the same frame again
+/// leaves it as it was.
+fn note_marker_path<T: Copy + PartialEq + 'static>(
+    window_id: gpui::WindowId,
+    path: &GlobalElementId,
+    marker: T,
+    cx: &mut App,
+) {
+    let known = cx
+        .try_global::<MarkerPaths<T>>()
+        .and_then(|paths| paths.0.get(&window_id))
+        .is_some_and(|paths| paths.iter().any(|(at, m)| *m == marker && at == path));
+    if known {
+        return;
+    }
+    let paths = cx
+        .default_global::<MarkerPaths<T>>()
+        .0
+        .entry(window_id)
+        .or_default();
+    paths.retain(|(_, m)| *m != marker);
+    paths.push((path.clone(), marker));
+}
+
+/// The innermost of `markers` whose element `path` is inside: the one with
+/// the longest path that `path` starts with.
+fn innermost_at<T: Copy>(markers: &[(GlobalElementId, T)], path: &[ElementId]) -> Option<T> {
+    markers
+        .iter()
+        .filter(|(at, _)| path.starts_with(at))
+        .max_by_key(|(at, _)| at.len())
+        .map(|(_, marker)| *marker)
+}
+
+/// The innermost marker of its kind around what is drawing now: the one on
+/// the stack, or, when no marker of the kind is drawing, the one whose
+/// element the current element id path is inside.
+fn marker_around<T: Copy + 'static>(window: &mut Window, cx: &App) -> Option<T> {
+    let window_id = window.window_handle().window_id();
+    if let Some(marker) = current_marker::<T>(window_id, cx) {
+        return Some(marker);
+    }
+    let markers = cx.try_global::<MarkerPaths<T>>()?.0.get(&window_id)?;
+    if markers.is_empty() {
+        return None;
+    }
+    // The id makes the path the current element's own children would have,
+    // which starts with every element around them.
+    let path = window.with_global_id(ElementId::Name("text-selection-path".into()), |id, _| {
+        id.clone()
+    });
+    innermost_at(markers, &path)
+}
+
 /// Runs `callback` with `marker` as the innermost marker of its kind for
 /// `window_id`, and takes it off again even if `callback` panics.
 fn with_marker<T: Copy + 'static, R>(
@@ -2970,6 +3044,7 @@ fn with_marker<T: Copy + 'static, R>(
     }
 }
 
+#[cfg(test)]
 fn current_text_selection_scope(
     window_id: gpui::WindowId,
     cx: &App,
@@ -3173,7 +3248,7 @@ struct SelectionMarker<E, T> {
     element: E,
 }
 
-impl<E: Element, T: Copy + 'static> IntoElement for SelectionMarker<E, T> {
+impl<E: Element, T: Copy + PartialEq + 'static> IntoElement for SelectionMarker<E, T> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -3181,7 +3256,7 @@ impl<E: Element, T: Copy + 'static> IntoElement for SelectionMarker<E, T> {
     }
 }
 
-impl<E: Element, T: Copy + 'static> Element for SelectionMarker<E, T> {
+impl<E: Element, T: Copy + PartialEq + 'static> Element for SelectionMarker<E, T> {
     type RequestLayoutState = E::RequestLayoutState;
     type PrepaintState = E::PrepaintState;
 
@@ -3201,6 +3276,9 @@ impl<E: Element, T: Copy + 'static> Element for SelectionMarker<E, T> {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let window_id = window.window_handle().window_id();
+        if let Some(id) = id {
+            note_marker_path(window_id, id, self.marker, cx);
+        }
         with_marker(window_id, self.marker, cx, |cx| {
             self.element.request_layout(id, inspector_id, window, cx)
         })
@@ -4564,6 +4642,51 @@ mod tests {
             selection_state.update(point(px(1.), px(1.)), cx);
             selection_state.end(cx);
             assert_eq!(selection_state.selected_text(cx), "third");
+        });
+    }
+
+    /// Text drawn while no marker of a kind is drawing, as when GPUI Fast
+    /// draws a view again on its own, finds the innermost marker around it by
+    /// its element path; one drawn since somewhere else no longer counts.
+    #[gpui::test]
+    fn text_finds_the_marker_around_it_by_path(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| WindowSelectionView {
+            selection: TextSelectionHandle::new("text", cx),
+        });
+        cx.update(|window, cx| {
+            let window_id = window.window_handle().window_id();
+            let (pane, card) = (TextSelectionRegionId::new(), TextSelectionRegionId::new());
+            let around =
+                |window: &mut Window, cx: &App| marker_around::<TextSelectionRegionId>(window, cx);
+            window.with_global_id("pane".into(), |at, window| {
+                note_marker_path(window_id, at, pane, cx);
+                window.with_global_id("card".into(), |at, window| {
+                    note_marker_path(window_id, at, card, cx);
+                    window.with_global_id("text".into(), |_, window| {
+                        assert_eq!(around(window, cx), Some(card), "the innermost");
+                    });
+                });
+                window.with_global_id("other".into(), |_, window| {
+                    assert_eq!(around(window, cx), Some(pane), "the pane around it");
+                });
+                // A marker drawing now wins over one found by path.
+                let drawing = TextSelectionRegionId::new();
+                with_marker(window_id, drawing, cx, |cx| {
+                    assert_eq!(around(window, cx), Some(drawing));
+                });
+            });
+            window.with_global_id("elsewhere".into(), |_, window| {
+                assert_eq!(around(window, cx), None, "outside every marker");
+            });
+            // The pane's marker drawn somewhere else leaves its old place.
+            window.with_global_id("moved".into(), |at, _| {
+                note_marker_path(window_id, at, pane, cx);
+            });
+            window.with_global_id("pane".into(), |_, window| {
+                window.with_global_id("other".into(), |_, window| {
+                    assert_eq!(around(window, cx), None, "the pane moved");
+                });
+            });
         });
     }
 
