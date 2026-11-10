@@ -16,6 +16,9 @@ version = "0.9.1"
 # page on macOS and Linux. `gpui-kit/gpui-fast` selects the backend; enable both together, a
 # mismatch fails to compile. Without either, the native view covers GPUI content in its bounds.
 gpui-fast = ["dep:objc2", "dep:objc2-foundation"]
+# Standard GPUI for the Kit, on by default; turn defaults off to build on GPUI Fast alone.
+default = ["gpui-pre"]
+gpui-pre = ["gpui-kit/gpui-pre"]
 inspector = ["wry/devtools"]
 
 [lib]
