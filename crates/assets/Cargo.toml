@@ -22,6 +22,7 @@ log.workspace = true
 
 [dev-dependencies]
 gpui_platform.workspace = true
+gpui-fast = { workspace = true, features = ["windows-manifest-provided-by-host"] }
 gpui-fast-platform.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
@@ -37,5 +38,5 @@ wasm-bindgen-futures = "0.4"
 # alone turns default features off and selects `gpui-fast`, so standard GPUI isn't
 # compiled at all. With both on, Fast is used.
 default = ["gpui-pre"]
-gpui-pre = ["dep:gpui"]
+gpui-pre = ["dep:gpui", "gpui-fast?/windows-manifest-provided-by-host"]
 gpui-fast = ["dep:gpui-fast"]

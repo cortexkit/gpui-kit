@@ -20,7 +20,7 @@ workspace = true
 # alone turns default features off and selects `gpui-fast`, so standard GPUI isn't
 # compiled at all. With both on, Fast is used.
 default = ["gpui-pre", "component", "assets"]
-gpui-pre = ["dep:gpui", "dep:gpui_platform", "dep:gpui_web", "gpui-base/gpui-pre", "gpui-component?/gpui-pre", "gpui-kit-assets?/gpui-pre"]
+gpui-pre = ["dep:gpui", "dep:gpui_platform", "dep:gpui_web", "gpui-base/gpui-pre", "gpui-component?/gpui-pre", "gpui-kit-assets?/gpui-pre", "gpui-fast?/windows-manifest-provided-by-host"]
 # Select GPUI Fast across the core, platforms, and already-enabled layers.
 gpui-fast = ["dep:gpui-fast", "dep:gpui-fast-platform", "dep:gpui-fast-web", "gpui-base/gpui-fast", "gpui-component?/gpui-fast", "gpui-kit-assets?/gpui-fast"]
 # The styled component library, `gpui_kit::component`. Initializes `gpui-base` too.
@@ -99,7 +99,7 @@ gpui-fast-web = { workspace = true, optional = true }
 [dev-dependencies]
 chrono = "0.4.38"
 gpui = { workspace = true, features = ["test-support"] }
-gpui-fast = { workspace = true, features = ["test-support"] }
+gpui-fast = { workspace = true, features = ["test-support", "windows-manifest-provided-by-host"] }
 lsp-types.workspace = true
 
 [[test]]

@@ -58,10 +58,10 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-gpui-fast = { workspace = true, features = ["test-support"] }
+gpui-fast = { workspace = true, features = ["test-support", "windows-manifest-provided-by-host"] }
 
 [lints]
 workspace = true
 
 [features]
-gpui-fast = ["dep:gpui-fast"]
+gpui-fast = ["dep:gpui-fast", "gpui-fast/windows-manifest-provided-by-host"]

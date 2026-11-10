@@ -20,6 +20,7 @@ path = "src/bin/gpui-shell.rs"
 [features]
 gpui-fast = [
     "dep:gpui-fast",
+    "gpui-fast/windows-manifest-provided-by-host",
     "dep:gpui-fast-platform",
     "gpui-base/gpui-fast",
     "gpui-fps/gpui-fast",
@@ -104,7 +105,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-gpui-fast = { workspace = true, features = ["test-support"] }
+gpui-fast = { workspace = true, features = ["test-support", "windows-manifest-provided-by-host"] }
 gpui-base = { workspace = true, features = ["test-support"] }
 gpui-component = { workspace = true, features = ["test-support"] }
 

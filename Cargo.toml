@@ -72,7 +72,12 @@ gpui_web = { package = "gpui-pre-web", version = "=0.3.12" }
 # Fast is optional; existing crates select it through their gpui-fast feature.
 # Explicit package fields make Cargo use these dependency keys as Rust crate names;
 # the packages declare the same library names as the pre backend.
-gpui-fast = { package = "gpui-fast", version = "0.1.14", features = ["windows-manifest-provided-by-host"] }
+# Fast embeds the Windows app manifest itself. A build that has standard GPUI too
+# gets its manifest from there, so each crate's `gpui-pre` feature (or, where
+# standard GPUI is always present, its `gpui-fast` feature) turns on
+# `windows-manifest-provided-by-host`: two manifests would clash, and with none
+# Windows can't find the newer common-controls entry points.
+gpui-fast = { package = "gpui-fast", version = "0.1.14" }
 gpui-fast-platform = { package = "gpui-fast-platform", version = "0.1.14", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-fast-web = { package = "gpui-fast-web", version = "0.1.14" }
 gpui_macros = { package = "gpui-pre-macros", version = "=0.3.12" }

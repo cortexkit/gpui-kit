@@ -29,7 +29,7 @@ harness = false
 # alone turns default features off and selects `gpui-fast`, so standard GPUI isn't
 # compiled at all. With both on, Fast is used.
 default = ["gpui-pre"]
-gpui-pre = ["dep:gpui"]
+gpui-pre = ["dep:gpui", "gpui-fast?/windows-manifest-provided-by-host"]
 gpui-fast = ["dep:gpui-fast"]
 decimal = ["dep:rust_decimal"]
 test-support = ["gpui?/test-support", "gpui-fast?/test-support"]
@@ -88,7 +88,7 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "s
 [dev-dependencies]
 criterion = "0.8"
 gpui = { workspace = true, features = ["test-support", "bench-support"] }
-gpui-fast = { workspace = true, features = ["test-support", "bench-support"] }
+gpui-fast = { workspace = true, features = ["test-support", "bench-support", "windows-manifest-provided-by-host"] }
 gpui_platform = { workspace = true, features = ["bench-support"] }
 gpui-fast-platform = { workspace = true, features = ["bench-support"] }
 indoc = "2"
