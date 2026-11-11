@@ -3684,9 +3684,14 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
         }
     });
 
+    // On capture, before any element sees the release: a control's click
+    // handler that stops the release from going further would otherwise leave
+    // the gesture running, and the selection would follow the pointer with no
+    // button held. Ending the gesture keeps its selection, so a handler that
+    // reads the selection on click still finds it.
     let mouse_up_state = state.downgrade();
     window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-        if phase.bubble()
+        if phase.capture()
             && let Some(state) = mouse_up_state.upgrade()
         {
             state.update(cx, |state, cx| {
@@ -6047,6 +6052,53 @@ mod tests {
                         })),
                 )
         }
+    }
+
+    /// A selectable text inside a control whose click handler stops the
+    /// release from going further, above a plain selectable text.
+    struct ClickableTextView;
+
+    impl Render for ClickableTextView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            use gpui::StatefulInteractiveElement as _;
+            div().size_full().child(TextSelectionLayer).child(
+                div()
+                    .w(px(400.))
+                    .child(
+                        div()
+                            .id("control")
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                crate::SelectableText::new(("text", 0usize), "press me here")
+                                    .document_order(0),
+                            ),
+                    )
+                    .child(
+                        crate::SelectableText::new(("text", 1usize), "other words below")
+                            .document_order(1),
+                    ),
+            )
+        }
+    }
+
+    /// A click whose handler stops the release from going further still ends
+    /// the selection the press began. Before, the selection never heard the
+    /// release, so it went on following the pointer with no button held.
+    #[gpui::test]
+    fn a_click_whose_handler_stops_the_release_still_ends_the_selection(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| ClickableTextView);
+        painted_selection(cx);
+
+        press_at("press me here", 0, 1, false, cx);
+        release(1, cx);
+        let elsewhere =
+            cx.update(|window, cx| painted_position("other words below", 11, window, cx));
+        cx.simulate_event(MouseMoveEvent {
+            position: elsewhere,
+            pressed_button: None,
+            modifiers: gpui::Modifiers::default(),
+        });
+        assert_eq!(painted_selection(cx), "");
     }
 
     /// The middle of the character at `index` of `text`, as it was painted.
